@@ -85,7 +85,7 @@ Prism has no dedicated command-line switch for hiding its launch progress dialog
 
 Complete account sign-in, Java setup, and any interactive prompts in visible Prism first. Offscreen mode also hides sign-in and error dialogs; turn the option off if a launch needs attention. Close any existing Prism process before using it: an already running launcher handles launch requests with its existing window settings.
 
-When hidden launch is enabled, pressing `Enter` keeps the terminal open with a loading screen: a spinner, elapsed time, and the latest recognized preparation stage. It follows the selected theme and shows no estimated percentage. The TUI closes when it detects the instance's Minecraft Java process; this means the process has started, not that its game window is ready.
+When hidden launch is enabled, pressing `Enter` keeps the terminal open with a loading screen: a spinner, elapsed time, and the latest recognized preparation stage. It follows the selected theme and shows no estimated percentage. The TUI closes on the first detection of the instance's Minecraft Java process, without an added waiting period. The game window may appear afterward; timing depends on the instance.
 
 ![Hidden launch progress in the terminal](docs/preview-launch.png)
 

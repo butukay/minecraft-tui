@@ -22,6 +22,7 @@ use std::{
 
 const SETTINGS_COUNT: usize = 3;
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(120);
+const GAME_PROCESS_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 struct LaunchProgress {
@@ -37,7 +38,6 @@ struct ActiveLaunch {
     phase: launcher::LaunchPhase,
     progress: LaunchProgress,
     last_process_check: Instant,
-    game_seen_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -287,7 +287,6 @@ impl App {
             phase: launcher::LaunchPhase::Preparing,
             progress,
             last_process_check: started,
-            game_seen_since: None,
         });
         Ok(())
     }
@@ -313,24 +312,17 @@ impl App {
         }
         active.phase = active.phase.max(update.phase);
         active.progress.tick = active.progress.tick.wrapping_add(1);
-        if active.last_process_check.elapsed() >= Duration::from_millis(250) {
+        if active.last_process_check.elapsed() >= GAME_PROCESS_CHECK_INTERVAL {
             let running = running_instances(std::slice::from_ref(&active.instance));
             if running.contains(&active.instance.path) {
-                let seen = active.game_seen_since.get_or_insert_with(Instant::now);
-                active.phase = launcher::LaunchPhase::StartingGame;
-                // Ignore transient Java checks and immediately crashing JVMs.
-                if seen.elapsed() >= Duration::from_millis(750) {
-                    self.running_instances.insert(active.instance.path.clone());
-                    self.should_quit = self.launch_progress.is_some();
-                    self.launch_progress = None;
-                    self.status = Some(format!(
-                        "Minecraft process started · {}",
-                        active.instance.name
-                    ));
-                    return;
-                }
-            } else {
-                active.game_seen_since = None;
+                self.running_instances.insert(active.instance.path.clone());
+                self.should_quit = self.launch_progress.is_some();
+                self.launch_progress = None;
+                self.status = Some(format!(
+                    "Minecraft process started · {}",
+                    active.instance.name
+                ));
+                return;
             }
             active.last_process_check = Instant::now();
         }
@@ -961,11 +953,10 @@ mod tests {
             phase: launcher::LaunchPhase::StartingGame,
             progress,
             last_process_check: now,
-            game_seen_since: Some(now),
         });
 
         // The backend still reports authentication between /proc probes.
-        // A phase already reached through process detection must not blink back.
+        // A previously reached phase must not blink back.
         for _ in 0..3 {
             app.poll_hidden_launch();
             assert_eq!(
@@ -977,6 +968,78 @@ mod tests {
         }
         drop(app);
         drop(output);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn first_game_process_detection_finishes_without_a_stability_delay() {
+        let directory = std::env::temp_dir().join(format!(
+            "minecraft-tui-first-process-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let instance_path = directory.join("instance");
+        fs::create_dir_all(&instance_path).unwrap();
+        // A sleep binary gives the fixture a real Linux process named
+        // java and a game directory, without launching Minecraft.
+        let java = directory.join("java");
+        if fs::hard_link("/bin/sleep", &java).is_err() {
+            fs::copy("/bin/sleep", &java).unwrap();
+        }
+        let spawn_game = || {
+            Command::new(&java)
+                .arg("5")
+                .current_dir(&instance_path)
+                .spawn()
+        };
+        let mut spawned = spawn_game();
+        // Concurrent test children may briefly inherit the copy's write handle
+        // until exec closes it. Retry only Linux's transient ETXTBSY fixture race.
+        for _ in 0..20 {
+            if !matches!(&spawned, Err(error) if error.raw_os_error() == Some(26)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            spawned = spawn_game();
+        }
+        let mut game = spawned.unwrap();
+
+        for foreground in [true, false] {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 0"]);
+            let handle =
+                launcher::start_command(&mut command, &directory.join("launcher.log")).unwrap();
+            let now = Instant::now();
+            let progress = LaunchProgress {
+                name: "Sample".into(),
+                stage: "Starting Minecraft".into(),
+                started: now,
+                tick: 0,
+            };
+            let mut app = App::demo();
+            let mut instance = app.selected().unwrap().clone();
+            instance.path = instance_path.clone();
+            app.launch_progress = foreground.then_some(progress.clone());
+            app.active_launch = Some(ActiveLaunch {
+                instance,
+                handle,
+                phase: launcher::LaunchPhase::StartingGame,
+                progress,
+                last_process_check: now - GAME_PROCESS_CHECK_INTERVAL,
+            });
+
+            app.poll_hidden_launch();
+            assert!(app.active_launch.is_none());
+            assert!(app.launch_progress.is_none());
+            assert_eq!(app.should_quit, foreground);
+            assert!(app.running_instances.contains(&instance_path));
+            assert!(app.status.unwrap().contains("Minecraft process started"));
+        }
+        game.kill().unwrap();
+        game.wait().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 
