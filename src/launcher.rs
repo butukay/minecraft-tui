@@ -12,7 +12,7 @@ use std::{
 const FLATPAK_ID: &str = "org.prismlauncher.PrismLauncher";
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LaunchPhase {
     #[default]
     Preparing,
@@ -43,7 +43,6 @@ pub struct LaunchHandle {
     log: fs::File,
     cursor: u64,
     pending: Vec<u8>,
-    discard_line: bool,
     phase: LaunchPhase,
     failure: Option<String>,
 }
@@ -78,12 +77,10 @@ impl LaunchHandle {
         if length < self.cursor {
             self.cursor = length;
             self.pending.clear();
-            self.discard_line = false;
         }
         if length.saturating_sub(self.cursor) > MAX_READ {
             self.cursor = length - MAX_READ;
             self.pending.clear();
-            self.discard_line = true;
         }
         self.log.seek(SeekFrom::Start(self.cursor))?;
         let mut bytes = Vec::new();
@@ -91,17 +88,18 @@ impl LaunchHandle {
         self.cursor += bytes.len() as u64;
         for byte in bytes {
             if byte == b'\n' {
-                if !self.discard_line {
-                    let line = String::from_utf8_lossy(&self.pending).to_ascii_lowercase();
-                    self.observe_line(&line);
-                }
+                let line = String::from_utf8_lossy(&self.pending).to_ascii_lowercase();
+                self.observe_line(&line);
                 self.pending.clear();
-                self.discard_line = false;
-            } else if !self.discard_line {
+            } else {
                 self.pending.push(byte);
                 if self.pending.len() > MAX_LINE {
-                    self.pending.clear();
-                    self.discard_line = true;
+                    // Modded Java command lines can exceed 8 KiB. Inspect each
+                    // bounded window for fixed markers, then retain overlap so
+                    // an EntryPoint marker is recognized across window borders.
+                    let line = String::from_utf8_lossy(&self.pending).to_ascii_lowercase();
+                    self.observe_line(&line);
+                    self.pending.drain(..MAX_LINE / 2);
                 }
             }
         }
@@ -121,14 +119,41 @@ impl LaunchHandle {
             self.failure.get_or_insert_with(|| {
                 "Authentication needs attention. Open Prism normally to sign in again.".into()
             });
+        } else if line.contains("component list update/resolve task failed. reason:") {
+            self.failure.get_or_insert_with(|| {
+                "Prism could not prepare the game files. Open Prism normally to see the error."
+                    .into()
+            });
         }
-        if line.contains("authflow:") || line.contains("authflow(") || line.contains("msastep(") {
-            self.phase = LaunchPhase::Authenticating;
-        } else if line.contains("minecraftloadandcheck(") || line.contains("netjob(") {
-            self.phase = LaunchPhase::Downloading;
-        } else if line.contains("launcherpartlaunch(") {
-            self.phase = LaunchPhase::StartingGame;
-        }
+        let candidate = if line.contains("org.prismlauncher.entrypoint")
+            || line.contains("org.multimc.entrypoint")
+            || line.contains("launcherpartlaunch(")
+        {
+            LaunchPhase::StartingGame
+        } else if line.contains(": downloading libraries")
+            || line.contains("starting asset index download for")
+            || line.contains("finished asset index download for")
+            || line.contains("loading components")
+            || line.contains("resolving dependencies")
+            || line.contains("component list update/resolve task succeeded")
+            || line.contains("minecraftloadandcheck(")
+            || (line.contains("netjob(")
+                && (line.contains("minecraft")
+                    || line.contains("libraries")
+                    || line.contains("assets")))
+        {
+            // These game-specific release/debug messages avoid advancing on the
+            // launcher's unrelated translation and update downloads at startup.
+            LaunchPhase::Downloading
+        } else if line.contains("authflow:")
+            || line.contains("authflow(")
+            || line.contains("msastep(")
+        {
+            LaunchPhase::Authenticating
+        } else {
+            LaunchPhase::Preparing
+        };
+        self.phase = self.phase.max(candidate);
     }
 }
 
@@ -210,7 +235,7 @@ fn launch_command(instance_path: &Path, hide_launcher: bool) -> Result<Command> 
     Ok(command)
 }
 
-fn start_command(command: &mut Command, path: &Path) -> Result<LaunchHandle> {
+pub(super) fn start_command(command: &mut Command, path: &Path) -> Result<LaunchHandle> {
     fs::create_dir_all(
         path.parent()
             .context("Launch log has no parent directory")?,
@@ -251,7 +276,6 @@ fn start_command(command: &mut Command, path: &Path) -> Result<LaunchHandle> {
         log: reader,
         cursor,
         pending: Vec::new(),
-        discard_line: false,
         phase: LaunchPhase::Preparing,
         failure: None,
     })
@@ -427,7 +451,7 @@ mod tests {
         let mut launch = start_command(&mut command, &log).unwrap();
         let mut writer = fs::OpenOptions::new().append(true).open(&log).unwrap();
         writer.write_all(&vec![b'x'; 200_000]).unwrap();
-        writer.write_all(b"\nOAuth2 request failed: transient\nThis plugin does not support raise()\nTask \"NetJob(files)\" starting for the first time\n").unwrap();
+        writer.write_all(b"\nOAuth2 request failed: transient\nThis plugin does not support raise()\nTask \"NetJob(Minecraft libraries)\" starting for the first time\n").unwrap();
         let update = launch.poll().unwrap();
         assert_eq!(update.failure, None);
         assert_eq!(update.phase, LaunchPhase::Downloading);
@@ -436,6 +460,43 @@ mod tests {
             .write_all(b"Task \"LaunchTask(current)\" failed: sensitive detail\n")
             .unwrap();
         assert!(launch.poll().unwrap().failure.is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_log_stages_advance_across_polls_and_never_regress() {
+        let directory = temporary_directory("release-phases");
+        let log = directory.join("launcher.log");
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let mut launch = start_command(&mut command, &log).unwrap();
+        let mut writer = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writer.write_all(b"Downloading translations index\nTask \"NetJob(translations)\" starting for the first time\nAuthFl").unwrap();
+        assert_eq!(launch.poll().unwrap().phase, LaunchPhase::Preparing);
+        writer
+            .write_all(b"ow: Logging in with Microsoft account\n")
+            .unwrap();
+        assert_eq!(launch.poll().unwrap().phase, LaunchPhase::Authenticating);
+        writer.write_all(b"[profile.resolve] Loading components\n[profile.resolve] Resolving dependencies\n[profile] Component list update/resolve task succeeded\n").unwrap();
+        assert_eq!(launch.poll().unwrap().phase, LaunchPhase::Downloading);
+        writer.write_all(b"AuthFlow: Fetching Minecraft access token\n\"sample\" : downloading libraries\nStarting asset index download for \"sample\"\nFinished asset index download for \"sample\"\n").unwrap();
+        assert_eq!(launch.poll().unwrap().phase, LaunchPhase::Downloading);
+        // Only a fixed class marker is interpreted, even on a long command
+        // line; arguments and potential private values never enter the update.
+        writer.write_all(&vec![b'x'; 20_000]).unwrap();
+        writer.write_all(b" org.prismlauncher.EntryPo").unwrap();
+        launch.poll().unwrap();
+        writer
+            .write_all(b"int redacted-private-arguments\n")
+            .unwrap();
+        let update = launch.poll().unwrap();
+        assert_eq!(update.phase, LaunchPhase::StartingGame);
+        assert_eq!(update.failure, None);
+        writer.write_all(b"AuthFlow: Getting skin\nTask \"NetJob(Minecraft libraries)\" succeeded\n[profile.resolve] Loading components\n").unwrap();
+        assert_eq!(launch.poll().unwrap(), update);
+        writer.write_all(b"org.multimc.EntryPoint\n").unwrap();
+        assert_eq!(launch.poll().unwrap(), update);
         fs::remove_dir_all(directory).unwrap();
     }
 }

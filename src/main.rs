@@ -34,6 +34,7 @@ struct LaunchProgress {
 struct ActiveLaunch {
     instance: Instance,
     handle: launcher::LaunchHandle,
+    phase: launcher::LaunchPhase,
     progress: LaunchProgress,
     last_process_check: Instant,
     game_seen_since: Option<Instant>,
@@ -283,6 +284,7 @@ impl App {
         self.active_launch = Some(ActiveLaunch {
             instance,
             handle,
+            phase: launcher::LaunchPhase::Preparing,
             progress,
             last_process_check: started,
             game_seen_since: None,
@@ -309,13 +311,13 @@ impl App {
             self.status = Some(format!("Launch failed: {failure} · check launcher.log"));
             return;
         }
-        active.progress.stage = update.phase.display().into();
+        active.phase = active.phase.max(update.phase);
         active.progress.tick = active.progress.tick.wrapping_add(1);
         if active.last_process_check.elapsed() >= Duration::from_millis(250) {
             let running = running_instances(std::slice::from_ref(&active.instance));
             if running.contains(&active.instance.path) {
                 let seen = active.game_seen_since.get_or_insert_with(Instant::now);
-                active.progress.stage = "Starting Minecraft".into();
+                active.phase = launcher::LaunchPhase::StartingGame;
                 // Ignore transient Java checks and immediately crashing JVMs.
                 if seen.elapsed() >= Duration::from_millis(750) {
                     self.running_instances.insert(active.instance.path.clone());
@@ -332,6 +334,9 @@ impl App {
             }
             active.last_process_check = Instant::now();
         }
+        // Process observations and launcher output arrive at different rates.
+        // Keep the furthest observed phase between process probes as well.
+        active.progress.stage = active.phase.display().into();
         if active.progress.started.elapsed() >= LAUNCH_TIMEOUT {
             self.launch_progress = None;
             self.status = Some("Still starting after 2 minutes · launch continues; check launcher.log or open Prism".into());
@@ -917,6 +922,62 @@ mod tests {
         assert!(!is_java_checker(
             b"java\0-cp\0/app/bin/jars/NewLaunch.jar\0org.prismlauncher.EntryPoint\0"
         ));
+    }
+
+    #[test]
+    fn game_start_stage_stays_latched_between_process_probes() {
+        use std::io::Write;
+
+        let directory = std::env::temp_dir().join(format!(
+            "minecraft-tui-stage-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = directory.join("launcher.log");
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let handle = launcher::start_command(&mut command, &log).unwrap();
+        let mut output = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(
+            output,
+            "0.5 Debug: AuthFlow: Fetching the Minecraft profile"
+        )
+        .unwrap();
+        let mut app = App::demo();
+        let now = Instant::now();
+        let progress = LaunchProgress {
+            name: "Sample".into(),
+            stage: "Starting Minecraft".into(),
+            started: now,
+            tick: 0,
+        };
+        app.launch_progress = Some(progress.clone());
+        app.active_launch = Some(ActiveLaunch {
+            instance: app.selected().unwrap().clone(),
+            handle,
+            phase: launcher::LaunchPhase::StartingGame,
+            progress,
+            last_process_check: now,
+            game_seen_since: Some(now),
+        });
+
+        // The backend still reports authentication between /proc probes.
+        // A phase already reached through process detection must not blink back.
+        for _ in 0..3 {
+            app.poll_hidden_launch();
+            assert_eq!(
+                app.launch_progress.as_ref().unwrap().stage,
+                "Starting Minecraft"
+            );
+            assert!(app.active_launch.is_some());
+            assert!(!app.should_quit);
+        }
+        drop(app);
+        drop(output);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
