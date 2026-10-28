@@ -1,163 +1,97 @@
 # Minecraft TUI
 
-![GIF of the application](https://github.com/KamiSenpai64/minecraft-tui/giphy.gif)
+![Minecraft TUI instance library](docs/preview.png)
 
-A terminal-based user interface for managing and launching Minecraft instances through PrismLauncher. Built with Rust and Ratatui for a fast, keyboard-driven experience.
+A quiet, keyboard-driven library for your [Prism Launcher](https://prismlauncher.org/) instances. Built with Rust and Ratatui, with a graphite palette, a soft green accent, and room for the things that matter.
 
-## Prerequisites
+- Search and sort instances by name, last played, or playtime.
+- See Minecraft versions, mod loaders, installed mods, and running instances.
+- Open instance folders or launch a game directly from the terminal.
+- Keep your preferences, including an optional hidden Prism window.
+- Use native Prism Launcher or its Flatpak package on Linux.
 
-- **PrismLauncher** - Installed via Flatpak
-- **Rust toolchain** - Version 1.70 or higher (for building from source)
-- **Linux** - Tested on Ubuntu/Debian-based systems
-- **xdg-open** - For opening instance folders
+## Build and run
 
-## Installation
+You need Linux, a current stable Rust toolchain, and Prism Launcher with an account and at least one configured instance. `xdg-open` is needed only to open instance folders.
 
-### Quick Install (Recommended)
-
-```bash
-# Clone the repository
-git clone git@github.com:KamiSenpai64/minecraft-tui.git
-cd minecraft-tui
-
-# Run the install script
-./install.sh
-```
-
-The install script will:
-- Build the release binary
-- Copy the launch script to `~/scripts`
-- Install the binary to `~/.local/bin`
-- Check for required dependencies
-
-### Manual Installation
+From this checkout:
 
 ```bash
-# Clone the repository
-git clone git@github.com:KamiSenpai64/minecraft-tui.git
-cd minecraft-tui
-
-# Build the release binary
 cargo build --release
-
-# Copy the launch script
-mkdir -p ~/scripts
-cp scripts/launch-minecraft.sh ~/scripts/
-chmod +x ~/scripts/launch-minecraft.sh
-
-# Run the application
 ./target/release/minecraft-tui
 ```
 
-### Optional: Add to PATH
+To install the binary in `~/.local/bin`:
 
 ```bash
-# Copy binary to local bin
-mkdir -p ~/.local/bin
-cp target/release/minecraft-tui ~/.local/bin/
-
-# Add to PATH (add to ~/.bashrc or ~/.zshrc)
-export PATH="$HOME/.local/bin:$PATH"
-
-# Now you can run from anywhere
-minecraft-tui
+./install.sh
 ```
 
-## How to Use
+Ensure `~/.local/bin` is in your `PATH`. Launching is handled by the binary; copying a helper script to `~/scripts` is no longer required.
 
-### Basic Navigation
+Try the interface with sample instances:
 
-- `↑` / `↓` or `j` / `k` - Navigate through instances
-- `Enter` - Launch the selected instance
-- `q` or `Esc` - Quit the application
-
-### Features
-
-- `o` - Open instance folder in file manager
-- `s` - Cycle sort mode (Name → Last Played → Playtime)
-- `/` - Enter search mode to filter instances
-- `i` - Toggle instance details panel
-- `Backspace` - Delete search query character (in search mode)
-- `Esc` - Exit search mode (when searching)
-
-## Preview
-
-Screenshots and demo GIFs coming soon! Run `minecraft-tui` to see it in action.
-
-## Implemented Features
-
-1. [x] **View All Instances** - Display all PrismLauncher instances with metadata
-2. [x] **Launch Instances** - Start Minecraft instances directly from the TUI
-3. [x] **Keyboard Navigation** - Navigate with arrow keys or vim-style (j/k)
-4. [x] **Display Metadata** - Show playtime and last played information
-5. [x] **Minecraft Version Display** - Show MC version next to instance name
-6. [x] **Mod Loader Detection** - Detect and display mod loader (Fabric, Forge, Quilt, NeoForge, Vanilla)
-7. [x] **Open Instance Folder** - Quick access to instance directory
-8. [x] **Multiple Sort Modes** - Sort by name, last played, or total playtime
-9. [x] **Real-time Search/Filter** - Filter instances as you type
-10. [x] **Instance Details Panel** - View comprehensive details in split view with mod count
-11. [x] **Running Status Indicator** - Visual indicator for active instances
-12. [x] **Automated CI/CD** - GitHub Actions for building and testing
-13. [x] **Unit Tests** - Test coverage for core functionality
-14. [x] **Easy Installation** - One-command install script
-
-## Upcoming Features
-
-15. [ ] **Refresh Instances** - Reload instance list without restarting (press 'r')
-16. [ ] **Favorites System** - Pin favorite instances to the top
-17. [ ] **Multiple Instance Launch** - Select and launch multiple instances
-18. [ ] **Configuration File** - Save user preferences and settings
-19. [ ] **Theme Support** - Customizable color schemes
-20. [ ] **Launch History** - Track and display launch history
-21. [ ] **Java Version Display** - Show which Java version each instance uses
-22. [ ] **World Count** - Display number of worlds per instance
-23. [ ] **Multi-Launcher Support** - Support for MultiMC, ATLauncher, etc.
-
-## Project Structure
-
-```
-minecraft-tui/
-├── src/
-│   └── main.rs          # Main application code
-├── Cargo.toml           # Rust dependencies
-├── README.md            # This file
-└── target/
-    └── release/
-        └── minecraft-tui # Compiled binary
+```bash
+cargo run -- --demo
 ```
 
-### Launch Script
+Demo mode does not launch games or save preferences.
 
-The application uses a bash script (`~/scripts/launch-minecraft.sh`) to launch instances in a detached process, ensuring Minecraft continues running after the TUI exits.
+## Keys
 
-## Troubleshooting
+| Key | Action |
+| --- | --- |
+| `↑` / `↓`, `k` / `j` | Select an instance |
+| `Enter` | Launch the selected instance |
+| `/` | Search by name; type to filter |
+| `Esc` in search | Clear the search and return to the library |
+| `s` | Cycle sort: name → last played → playtime |
+| `i` | Toggle instance details |
+| `o` | Open the selected instance folder |
+| `r` | Refresh instances |
+| `,` | Open settings |
+| `?` | Show keyboard help |
+| `q` / `Esc` | Quit or close the current overlay |
+| `Ctrl-C` | Quit |
 
-### Instance Not Launching
+In settings, use `↑` / `↓` to select a preference and `Enter` or `Space` to toggle it. Preferences are saved when changed. On narrow terminals, details replace the library; press `i` to return.
 
-If pressing Enter doesn't launch an instance:
-- Verify PrismLauncher is installed: `flatpak list | grep Prism`
-- Check the launch script exists: `ls ~/scripts/launch-minecraft.sh`
-- Ensure the script is executable: `chmod +x ~/scripts/launch-minecraft.sh`
+## Hide the Prism window
 
-### Instances Not Showing
+Open settings with `,` and enable **Hide launcher window**. This is off by default.
 
-If no instances appear:
-- Verify PrismLauncher path: `~/.var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances`
-- Ensure you have at least one instance created in PrismLauncher
+Prism has no dedicated command-line switch for hiding its launch progress dialog. This option starts it with Qt's `-platform offscreen`, hiding the launcher's windows while Minecraft opens normally. It does not change Prism's own settings or the game's environment.
 
-### Running Indicator Not Working
+Complete account sign-in, Java setup, and any interactive prompts in visible Prism first. Offscreen mode also hides sign-in and error dialogs; turn the option off if a launch needs attention. Close any existing Prism process before using it: an already running launcher handles launch requests with its existing window settings.
 
-The running status check uses `ps aux` to detect active Minecraft processes. If it's not working:
-- Verify processes are visible: `ps aux | grep flatpak | grep PrismLauncher`
+Minecraft continues running after the TUI closes. Launch output is saved to `$XDG_STATE_HOME/minecraft-tui/launcher.log`, or `~/.local/state/minecraft-tui/launcher.log` when unset. If your Qt installation lacks the offscreen platform plugin, disable this option and check that log.
 
-### Releases
-The reccomended way of using minecraft-tui is downloading the latest release, as it does not have the README.md file, LICENSE file, etc.
+## Data and preferences
 
-## Contributing
+Instances are discovered in the standard locations:
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
+- Native: `$XDG_DATA_HOME/PrismLauncher/instances`, or `~/.local/share/PrismLauncher/instances` when unset.
+- Flatpak: `~/.var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances`.
+
+Preferences live at `$XDG_CONFIG_HOME/minecraft-tui/config.json`, or `~/.config/minecraft-tui/config.json` when unset:
+
+```json
+{
+  "hide_launcher": false,
+  "details": false
+}
+```
+
+Instances and accounts remain managed by Prism Launcher. Create, import, update, and authenticate them there, then press `r` in the TUI to refresh the library.
+
+## Development
+
+```bash
+cargo fmt -- --check
+cargo clippy -- -D warnings
+cargo test
+```
 
 ## License
 
-MIT
-
+[MIT](LICENSE). Based on [KamiSenpai64/minecraft-tui](https://github.com/KamiSenpai64/minecraft-tui); original copyright and license are preserved.

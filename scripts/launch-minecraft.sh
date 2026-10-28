@@ -1,12 +1,33 @@
 #!/bin/bash
-# Launch Minecraft instance via PrismLauncher
-# Usage: launch-minecraft.sh "instance-name"
+# Optional standalone helper. The TUI launches Prism directly and does not need
+# this script installed. Prism expects the instance directory ID, not its label.
+# Usage: launch-minecraft.sh "instance-id" [--hide-launcher]
 
-if [ -z "$1" ]; then
-    echo "Usage: $0 <instance-name>"
+set -euo pipefail
+
+if [ -z "${1:-}" ] || [ "$#" -gt 2 ]; then
+    echo "Usage: $0 <instance-id> [--hide-launcher]" >&2
     exit 1
 fi
 
-# Launch the instance completely detached using nohup
-nohup flatpak run org.prismlauncher.PrismLauncher --launch "$1" >/dev/null 2>&1 &
+instance_id=$1
+qt_args=()
+if [ "${2:-}" = "--hide-launcher" ]; then
+    qt_args=(-platform offscreen)
+elif [ "$#" -eq 2 ]; then
+    echo "Unknown option: $2" >&2
+    exit 1
+fi
+
+if command -v prismlauncher >/dev/null 2>&1; then
+    launcher=(prismlauncher)
+else
+    launcher=(flatpak run org.prismlauncher.PrismLauncher)
+fi
+
+umask 077
+launch_state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/minecraft-tui
+mkdir -p "$launch_state_dir"
+nohup "${launcher[@]}" "${qt_args[@]}" --launch "$instance_id" \
+    </dev/null >>"$launch_state_dir/launcher.log" 2>&1 &
 disown

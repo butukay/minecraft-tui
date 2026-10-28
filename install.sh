@@ -13,10 +13,11 @@ if ! command -v cargo &> /dev/null; then
     exit 1
 fi
 
-# Check if PrismLauncher is installed
-if ! flatpak list | grep -q "org.prismlauncher.PrismLauncher"; then
-    echo "Warning: PrismLauncher not detected via Flatpak"
-    echo "  Install with: flatpak install flathub org.prismlauncher.PrismLauncher"
+# Check both supported Prism installations.
+if ! command -v prismlauncher &> /dev/null &&
+   ! (command -v flatpak &> /dev/null && flatpak info org.prismlauncher.PrismLauncher &> /dev/null); then
+    echo "Warning: Prism Launcher was not detected"
+    echo "  Install a native package or: flatpak install flathub org.prismlauncher.PrismLauncher"
     read -p "Continue anyway? (y/N) " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -26,12 +27,6 @@ fi
 
 echo "Building minecraft-tui..."
 cargo build --release
-
-echo ""
-echo "Installing launch script..."
-mkdir -p ~/scripts
-cp scripts/launch-minecraft.sh ~/scripts/
-chmod +x ~/scripts/launch-minecraft.sh
 
 echo ""
 echo "Installing binary..."

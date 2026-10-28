@@ -1,25 +1,22 @@
-use anyhow::Result;
+mod config;
+mod launcher;
+mod ui;
+
+use anyhow::{Context, Result};
+use config::Settings;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Frame, Terminal,
-};
+use ratatui::{Terminal, backend::CrosstermBackend, widgets::ListState};
 use serde::Deserialize;
 use std::{
-    fs,
-    io,
+    collections::HashSet,
+    fs, io,
     path::{Path, PathBuf},
-    process::Command,
-    thread,
-    time::Duration,
+    process::{Command, Stdio},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,19 +27,19 @@ enum SortMode {
 }
 
 impl SortMode {
-    fn next(&self) -> Self {
+    fn next(self) -> Self {
         match self {
-            SortMode::Name => SortMode::LastPlayed,
-            SortMode::LastPlayed => SortMode::Playtime,
-            SortMode::Playtime => SortMode::Name,
+            Self::Name => Self::LastPlayed,
+            Self::LastPlayed => Self::Playtime,
+            Self::Playtime => Self::Name,
         }
     }
 
-    fn display(&self) -> &str {
+    fn display(self) -> &'static str {
         match self {
-            SortMode::Name => "Name",
-            SortMode::LastPlayed => "Last Played",
-            SortMode::Playtime => "Playtime",
+            Self::Name => "Name",
+            Self::LastPlayed => "Last played",
+            Self::Playtime => "Playtime",
         }
     }
 }
@@ -57,24 +54,7 @@ struct Instance {
     time_played_secs: Option<u64>,
     mc_version: Option<String>,
     mod_loader: Option<String>,
-}
-
-fn is_instance_running(instance_name: &str) -> bool {
-    // Check if there's a flatpak process running with this instance name
-    if let Ok(output) = Command::new("ps")
-        .args(&["aux"])
-        .output()
-    {
-        if let Ok(stdout) = String::from_utf8(output.stdout) {
-            // Look for flatpak processes with the instance name in the command
-            return stdout.lines().any(|line| {
-                line.contains("flatpak") &&
-                line.contains("PrismLauncher") &&
-                line.contains(instance_name)
-            });
-        }
-    }
-    false
+    mod_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,741 +93,636 @@ struct App {
     search_mode: bool,
     search_query: String,
     details_mode: bool,
+    settings: Settings,
+    settings_open: bool,
+    settings_selected: usize,
+    help_open: bool,
+    status: Option<String>,
+    running_instances: HashSet<PathBuf>,
+    demo: bool,
 }
 
 impl App {
     fn new() -> Result<Self> {
-        let instances = load_instances()?;
-        let filtered_instances = instances.clone();
-        let mut list_state = ListState::default();
-        if !instances.is_empty() {
-            list_state.select(Some(0));
-        }
+        let settings = Settings::load()?;
+        let mut app = Self::from_instances(load_instances()?, settings);
+        app.refresh_running();
+        Ok(app)
+    }
 
-        Ok(Self {
+    fn from_instances(instances: Vec<Instance>, settings: Settings) -> Self {
+        let mut app = Self {
             instances,
-            filtered_instances,
-            list_state,
+            filtered_instances: Vec::new(),
+            list_state: ListState::default(),
             should_quit: false,
             should_launch: false,
             sort_mode: SortMode::Name,
             search_mode: false,
             search_query: String::new(),
-            details_mode: false,
-        })
+            details_mode: settings.details,
+            settings,
+            settings_open: false,
+            settings_selected: 0,
+            help_open: false,
+            status: None,
+            running_instances: HashSet::new(),
+            demo: false,
+        };
+        app.sort_instances();
+        app.update_filter();
+        app
+    }
+
+    fn demo() -> Self {
+        let instances = [
+            (
+                "A quiet world",
+                "1.21.5",
+                "Fabric",
+                37,
+                146_400,
+                "2 hours ago",
+            ),
+            (
+                "Better adventures",
+                "1.20.1",
+                "Forge",
+                124,
+                27_000,
+                "Yesterday",
+            ),
+            (
+                "Create something",
+                "1.20.1",
+                "NeoForge",
+                86,
+                68_520,
+                "3 days ago",
+            ),
+            ("The original", "1.12.2", "Vanilla", 0, 7_440, "Last week"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(
+            |(i, (name, version, loader, mods, seconds, last))| Instance {
+                name: name.into(),
+                path: PathBuf::from(format!("/demo/PrismLauncher/instances/world-{}", i + 1)),
+                last_played: Some(last.into()),
+                last_played_ts: Some(4 - i as u64),
+                time_played: Some(format_duration(seconds)),
+                time_played_secs: Some(seconds),
+                mc_version: Some(version.into()),
+                mod_loader: Some(loader.into()),
+                mod_count: mods,
+            },
+        )
+        .collect();
+        let mut app = Self::from_instances(instances, Settings::default());
+        app.demo = true;
+        app
+    }
+
+    fn selected(&self) -> Option<&Instance> {
+        self.list_state
+            .selected()
+            .and_then(|i| self.filtered_instances.get(i))
     }
 
     fn next(&mut self) {
-        if self.filtered_instances.is_empty() {
-            return;
+        if !self.filtered_instances.is_empty() {
+            let i = self
+                .list_state
+                .selected()
+                .map_or(0, |i| (i + 1) % self.filtered_instances.len());
+            self.list_state.select(Some(i));
         }
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i >= self.filtered_instances.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
-            }
-            None => 0,
-        };
-        self.list_state.select(Some(i));
     }
 
     fn previous(&mut self) {
-        if self.filtered_instances.is_empty() {
-            return;
+        if !self.filtered_instances.is_empty() {
+            let len = self.filtered_instances.len();
+            let i = self
+                .list_state
+                .selected()
+                .map_or(0, |i| (i + len - 1) % len);
+            self.list_state.select(Some(i));
         }
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.filtered_instances.len() - 1
-                } else {
-                    i - 1
-                }
+    }
+
+    fn request_launch(&mut self) {
+        if let Some(instance) = self.selected() {
+            if self.demo {
+                self.status = Some("Preview only · no game will be launched".into());
+            } else if self.running_instances.contains(&instance.path) {
+                self.status = Some("This instance is already running".into());
+            } else {
+                // Preserve the filtered selection until after terminal restoration.
+                self.should_launch = true;
+                self.should_quit = true;
             }
-            None => 0,
-        };
-        self.list_state.select(Some(i));
+        }
     }
 
     fn launch_selected(&self) -> Result<()> {
-        if let Some(selected) = self.list_state.selected() {
-            if let Some(instance) = self.filtered_instances.get(selected) {
-                launch_instance(&instance.name)?;
-            }
+        if let Some(instance) = self.selected() {
+            launcher::launch_instance(&instance.path, self.settings.hide_launcher)?;
         }
         Ok(())
     }
 
     fn open_folder_selected(&self) -> Result<()> {
-        if let Some(selected) = self.list_state.selected() {
-            if let Some(instance) = self.filtered_instances.get(selected) {
-                Command::new("xdg-open")
-                    .arg(&instance.path)
-                    .spawn()?;
-            }
+        if let Some(instance) = self.selected()
+            && !self.demo
+        {
+            Command::new("xdg-open")
+                .arg(&instance.path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("Could not open the instance folder")?;
         }
         Ok(())
     }
 
-    fn cycle_sort(&mut self) {
-        self.sort_mode = self.sort_mode.next();
-        self.sort_instances();
-        self.update_filter();
-        // Reset selection to top
-        if !self.filtered_instances.is_empty() {
-            self.list_state.select(Some(0));
-        }
-    }
-
     fn sort_instances(&mut self) {
-        match self.sort_mode {
-            SortMode::Name => {
-                self.instances.sort_by(|a, b| a.name.cmp(&b.name));
-            }
-            SortMode::LastPlayed => {
-                self.instances.sort_by(|a, b| {
-                    b.last_played_ts.unwrap_or(0).cmp(&a.last_played_ts.unwrap_or(0))
-                });
-            }
-            SortMode::Playtime => {
-                self.instances.sort_by(|a, b| {
-                    b.time_played_secs.unwrap_or(0).cmp(&a.time_played_secs.unwrap_or(0))
-                });
-            }
-        }
+        self.instances.sort_by(|a, b| match self.sort_mode {
+            SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortMode::LastPlayed => b
+                .last_played_ts
+                .cmp(&a.last_played_ts)
+                .then_with(|| a.name.cmp(&b.name)),
+            SortMode::Playtime => b
+                .time_played_secs
+                .cmp(&a.time_played_secs)
+                .then_with(|| a.name.cmp(&b.name)),
+        });
     }
 
     fn update_filter(&mut self) {
-        if self.search_query.is_empty() {
-            self.filtered_instances = self.instances.clone();
-        } else {
-            let query = self.search_query.to_lowercase();
-            self.filtered_instances = self.instances
-                .iter()
-                .filter(|instance| instance.name.to_lowercase().contains(&query))
-                .cloned()
-                .collect();
-        }
+        let selected_path = self.selected().map(|instance| instance.path.clone());
+        let query = self.search_query.to_lowercase();
+        self.filtered_instances = self
+            .instances
+            .iter()
+            .filter(|instance| instance.name.to_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        let selection = selected_path
+            .and_then(|path| self.filtered_instances.iter().position(|i| i.path == path))
+            .or_else(|| (!self.filtered_instances.is_empty()).then_some(0));
+        self.list_state.select(selection);
+    }
 
-        // Reset selection if needed
-        if !self.filtered_instances.is_empty() && self.list_state.selected().is_none() {
-            self.list_state.select(Some(0));
-        } else if let Some(selected) = self.list_state.selected() {
-            if selected >= self.filtered_instances.len() {
-                self.list_state.select(Some(0));
+    fn refresh(&mut self) -> Result<()> {
+        if !self.demo {
+            self.instances = load_instances()?;
+            self.sort_instances();
+            self.update_filter();
+            self.refresh_running();
+        }
+        self.status = Some("Library refreshed".into());
+        Ok(())
+    }
+
+    fn refresh_running(&mut self) {
+        if !self.demo {
+            self.running_instances = running_instances(&self.instances);
+        }
+    }
+
+    fn save_settings(&mut self) {
+        if !self.demo {
+            self.status = match self.settings.save() {
+                Ok(()) => Some("Settings saved".into()),
+                Err(err) => Some(format!("Could not save settings: {err:#}")),
+            };
+        }
+    }
+
+    fn toggle_setting(&mut self) {
+        if self.settings_selected == 0 {
+            self.settings.hide_launcher = !self.settings.hide_launcher;
+        } else {
+            self.settings.details = !self.settings.details;
+            self.details_mode = self.settings.details;
+        }
+        self.save_settings();
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return Ok(());
+        }
+        if self.settings_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char(',') | KeyCode::Char('q') => {
+                    self.settings_open = false
+                }
+                KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k') | KeyCode::Tab => {
+                    self.settings_selected ^= 1
+                }
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
+                    self.toggle_setting()
+                }
+                _ => {}
+            }
+        } else if self.help_open {
+            self.help_open = false;
+        } else if self.search_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.search_mode = false;
+                    self.search_query.clear();
+                    self.update_filter();
+                }
+                KeyCode::Enter => self.request_launch(),
+                KeyCode::Down => self.next(),
+                KeyCode::Up => self.previous(),
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    self.update_filter();
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.search_query.push(c);
+                    self.update_filter();
+                }
+                _ => {}
+            }
+        } else {
+            self.status = None;
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+                KeyCode::Down | KeyCode::Char('j') => self.next(),
+                KeyCode::Up | KeyCode::Char('k') => self.previous(),
+                KeyCode::Enter => self.request_launch(),
+                KeyCode::Char('o') => self.open_folder_selected()?,
+                KeyCode::Char('s') => {
+                    self.sort_mode = self.sort_mode.next();
+                    self.sort_instances();
+                    self.update_filter();
+                }
+                KeyCode::Char('/') => self.search_mode = true,
+                KeyCode::Char('i') => {
+                    self.details_mode = !self.details_mode;
+                    self.settings.details = self.details_mode;
+                    self.save_settings();
+                }
+                KeyCode::Char('r') => self.refresh()?,
+                KeyCode::Char(',') => self.settings_open = true,
+                KeyCode::Char('?') => self.help_open = true,
+                _ => {}
             }
         }
+        Ok(())
     }
+}
 
-    fn enter_search_mode(&mut self) {
-        self.search_mode = true;
-        self.search_query.clear();
-        self.update_filter();
-    }
-
-    fn exit_search_mode(&mut self) {
-        self.search_mode = false;
-        self.search_query.clear();
-        self.update_filter();
-    }
-
-    fn update_search_query(&mut self, c: char) {
-        self.search_query.push(c);
-        self.update_filter();
-    }
-
-    fn backspace_search(&mut self) {
-        self.search_query.pop();
-        self.update_filter();
-    }
-
-    fn toggle_details(&mut self) {
-        self.details_mode = !self.details_mode;
-    }
+fn instance_roots() -> Result<Vec<PathBuf>> {
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".local/share"));
+    Ok(vec![
+        data_home.join("PrismLauncher/instances"),
+        home.join(".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances"),
+    ])
 }
 
 fn load_instances() -> Result<Vec<Instance>> {
-    let home = std::env::var("HOME")?;
-    let instances_path = Path::new(&home)
-        .join(".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances");
+    load_instances_from(&instance_roots()?)
+}
 
-    if !instances_path.exists() {
-        return Ok(Vec::new());
-    }
-
+fn load_instances_from(roots: &[PathBuf]) -> Result<Vec<Instance>> {
     let mut instances = Vec::new();
-
-    for entry in fs::read_dir(instances_path)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            let config_path = path.join("instance.cfg");
-            if config_path.exists() {
-                if let Ok(config_str) = fs::read_to_string(&config_path) {
-                    if let Ok(config) = serde_ini::from_str::<InstanceConfig>(&config_str) {
-                        let last_played_ts = config.general.last_launch_time;
-                        let last_played = last_played_ts.map(format_timestamp);
-
-                        let time_played_secs = config.general.total_time_played;
-                        let time_played = time_played_secs.map(format_duration);
-
-                        // Try to get Minecraft version and mod loader from mmc-pack.json
-                        let mut mc_version = None;
-                        let mut mod_loader = None;
-
-                        if path.join("mmc-pack.json").exists() {
-                            if let Ok(content) = fs::read_to_string(path.join("mmc-pack.json")) {
-                                if let Ok(pack) = serde_json::from_str::<MMCPack>(&content) {
-                                    // Get Minecraft version
-                                    mc_version = pack.components
-                                        .iter()
-                                        .find(|c| c.uid == "net.minecraft")
-                                        .and_then(|c| c.version.clone());
-
-                                    // Detect mod loader
-                                    for component in &pack.components {
-                                        if component.uid.contains("fabric") {
-                                            mod_loader = Some("Fabric".to_string());
-                                            break;
-                                        } else if component.uid.contains("forge") {
-                                            mod_loader = Some("Forge".to_string());
-                                            break;
-                                        } else if component.uid.contains("quilt") {
-                                            mod_loader = Some("Quilt".to_string());
-                                            break;
-                                        } else if component.uid.contains("neoforge") {
-                                            mod_loader = Some("NeoForge".to_string());
-                                            break;
-                                        }
-                                    }
-
-                                    // If no mod loader found, it's vanilla
-                                    if mod_loader.is_none() {
-                                        mod_loader = Some("Vanilla".to_string());
-                                    }
-                                }
-                            }
-                        }
-
-                        instances.push(Instance {
-                            name: config.general.name,
-                            path: path.clone(),
-                            last_played,
-                            last_played_ts,
-                            time_played,
-                            time_played_secs,
-                            mc_version,
-                            mod_loader,
-                        });
-                    }
-                }
+    let mut seen = HashSet::new();
+    for root in roots.iter().filter(|p| p.is_dir()) {
+        for entry in
+            fs::read_dir(root).with_context(|| format!("Could not read {}", root.display()))?
+        {
+            let path = entry?.path();
+            if !path.is_dir()
+                || !seen.insert(fs::canonicalize(&path).unwrap_or_else(|_| path.clone()))
+            {
+                continue;
             }
+            let Ok(content) = fs::read_to_string(path.join("instance.cfg")) else {
+                continue;
+            };
+            let Ok(config) = serde_ini::from_str::<InstanceConfig>(&content) else {
+                continue;
+            };
+            let pack = fs::read_to_string(path.join("mmc-pack.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<MMCPack>(&s).ok());
+            let mc_version = pack.as_ref().and_then(|pack| {
+                pack.components
+                    .iter()
+                    .find(|c| c.uid == "net.minecraft")
+                    .and_then(|c| c.version.clone())
+            });
+            let mod_loader = pack
+                .as_ref()
+                .map(|pack| detect_loader(&pack.components).to_string());
+            let mods_dir = path.join(".minecraft/mods");
+            let mod_count = fs::read_dir(mods_dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            instances.push(Instance {
+                name: config.general.name,
+                path,
+                last_played: config
+                    .general
+                    .last_launch_time
+                    .filter(|&ts| ts > 0)
+                    .map(format_timestamp),
+                last_played_ts: config.general.last_launch_time.filter(|&ts| ts > 0),
+                time_played: config.general.total_time_played.map(format_duration),
+                time_played_secs: config.general.total_time_played,
+                mc_version,
+                mod_loader,
+                mod_count,
+            });
         }
     }
-
-    instances.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(instances)
 }
 
+fn detect_loader(components: &[Component]) -> &'static str {
+    for (uid, label) in [
+        ("net.neoforged", "NeoForge"),
+        ("org.quiltmc", "Quilt"),
+        ("net.fabricmc", "Fabric"),
+        ("net.minecraftforge", "Forge"),
+    ] {
+        if components.iter().any(|c| c.uid.starts_with(uid)) {
+            return label;
+        }
+    }
+    "Vanilla"
+}
+
+fn running_instances(instances: &[Instance]) -> HashSet<PathBuf> {
+    let mut running = HashSet::new();
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return running;
+    };
+    for entry in processes.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+        let proc_path = entry.path();
+        let Ok(exe) = fs::read_link(proc_path.join("exe")) else {
+            continue;
+        };
+        if !exe.file_name().is_some_and(|n| n == "java" || n == "javaw") {
+            continue;
+        }
+        let args = fs::read(proc_path.join("cmdline")).unwrap_or_default();
+        let cwd = fs::read_link(proc_path.join("cwd")).ok();
+        for instance in instances {
+            if cwd.as_ref().is_some_and(|p| p.starts_with(&instance.path))
+                || args.split(|&b| b == 0).any(|arg| {
+                    Path::new(std::ffi::OsStr::from_bytes(arg)).starts_with(&instance.path)
+                })
+            {
+                running.insert(instance.path.clone());
+            }
+        }
+    }
+    running
+}
+
+use std::os::unix::ffi::OsStrExt;
+
 fn format_timestamp(timestamp_ms: u64) -> String {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    let duration = Duration::from_millis(timestamp_ms);
-    let datetime = UNIX_EPOCH + duration;
-    let elapsed = SystemTime::now().duration_since(datetime).ok();
-
-    if let Some(elapsed) = elapsed {
-        let days = elapsed.as_secs() / 86400;
-        if days > 0 {
-            return format!("{} days ago", days);
-        }
-        let hours = elapsed.as_secs() / 3600;
-        if hours > 0 {
-            return format!("{} hours ago", hours);
-        }
-        let minutes = elapsed.as_secs() / 60;
-        if minutes > 0 {
-            return format!("{} minutes ago", minutes);
-        }
-        "Just now".to_string()
-    } else {
-        "Recently".to_string()
+    let elapsed = UNIX_EPOCH
+        .checked_add(Duration::from_millis(timestamp_ms))
+        .and_then(|time| SystemTime::now().duration_since(time).ok());
+    match elapsed.map(|d| d.as_secs()) {
+        Some(seconds) if seconds >= 86_400 => format!("{}d ago", seconds / 86_400),
+        Some(seconds) if seconds >= 3_600 => format!("{}h ago", seconds / 3_600),
+        Some(seconds) if seconds >= 60 => format!("{}m ago", seconds / 60),
+        Some(_) => "Just now".into(),
+        None => "Recently".into(),
     }
 }
 
 fn format_duration(seconds: u64) -> String {
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-
-    if hours > 0 {
-        format!("{}h {}m", hours, minutes)
-    } else if minutes > 0 {
-        format!("{}m", minutes)
-    } else {
-        format!("{}s", seconds)
+    match (seconds / 3600, (seconds % 3600) / 60) {
+        (hours, minutes) if hours > 0 => format!("{hours}h {minutes}m"),
+        (_, minutes) if minutes > 0 => format!("{minutes}m"),
+        _ => format!("{seconds}s"),
     }
-}
-
-fn launch_instance(instance_name: &str) -> Result<()> {
-    // Call the dedicated launch script
-    let home = std::env::var("HOME")?;
-    let script_path = format!("{}/scripts/launch-minecraft.sh", home);
-
-    Command::new(&script_path)
-        .arg(instance_name)
-        .spawn()?;
-
-    Ok(())
 }
 
 fn main() -> Result<()> {
-    let mut terminal = setup_terminal()?;
-    let mut app = App::new()?;
-    let res = run_app(&mut terminal, &mut app);
-    restore_terminal(&mut terminal)?;
-
-    if let Err(err) = res {
-        eprintln!("Error: {:?}", err);
-        return Ok(());
+    let mut demo = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--demo" => demo = true,
+            "--help" | "-h" => {
+                println!(
+                    "minecraft-tui\n\nUsage: minecraft-tui [--demo]\n\n  --demo  Preview with sample instances (no games or settings are changed)\n  --help  Show this help\n\nPress , for settings or ? for keyboard shortcuts."
+                );
+                return Ok(());
+            }
+            _ => anyhow::bail!("Unknown option: {arg}. Use --help for usage."),
+        }
     }
-
-    // Launch instance AFTER terminal is restored
+    // Load fallible configuration before entering the terminal's alternate screen.
+    let mut app = if demo { App::demo() } else { App::new()? };
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        previous_hook(info);
+    }));
+    let mut terminal = setup_terminal()?;
+    let result = run_app(&mut terminal, &mut app);
+    let restored = restore_terminal(&mut terminal);
+    result?;
+    restored?;
     if app.should_launch {
         app.launch_selected()?;
-        // Give the script time to spawn the flatpak process
-        thread::sleep(Duration::from_secs(1));
     }
-
     Ok(())
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let terminal = Terminal::new(backend)?;
-    Ok(terminal)
+    if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(err.into());
+    }
+    match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(terminal) => Ok(terminal),
+        Err(err) => {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            Err(err.into())
+        }
+    }
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    let raw_result = disable_raw_mode();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    raw_result?;
     Ok(())
 }
 
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
-    loop {
-        terminal.draw(|f| ui(f, app))?;
-
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                if app.search_mode {
-                    // In search mode
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.exit_search_mode();
-                        }
-                        KeyCode::Char(c) => {
-                            app.update_search_query(c);
-                        }
-                        KeyCode::Backspace => {
-                            app.backspace_search();
-                        }
-                        KeyCode::Enter => {
-                            // Exit search and launch
-                            app.exit_search_mode();
-                            app.should_quit = true;
-                            app.should_launch = true;
-                        }
-                        KeyCode::Down => {
-                            app.next();
-                        }
-                        KeyCode::Up => {
-                            app.previous();
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // Normal mode
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            app.should_quit = true;
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            app.next();
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.previous();
-                        }
-                        KeyCode::Enter => {
-                            app.should_quit = true;
-                            app.should_launch = true;
-                        }
-                        KeyCode::Char('o') => {
-                            app.open_folder_selected()?;
-                        }
-                        KeyCode::Char('s') => {
-                            app.cycle_sort();
-                        }
-                        KeyCode::Char('/') => {
-                            app.enter_search_mode();
-                        }
-                        KeyCode::Char('i') => {
-                            app.toggle_details();
-                        }
-                        _ => {}
-                    }
-                }
-            }
+    let mut last_running_check = Instant::now();
+    while !app.should_quit {
+        terminal.draw(|frame| ui::ui(frame, app))?;
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(key) = event::read()?
+            && let Err(err) = app.handle_key(key)
+        {
+            app.status = Some(format!("{err:#}"));
         }
-
-        if app.should_quit {
-            break;
+        if last_running_check.elapsed() >= Duration::from_secs(2) {
+            app.refresh_running();
+            last_running_check = Instant::now();
         }
     }
-
     Ok(())
-}
-
-fn ui(f: &mut Frame, app: &mut App) {
-    if app.details_mode {
-        // Details view: split horizontally
-        let main_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ])
-            .split(f.area());
-
-        let content_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(40),
-                Constraint::Percentage(60),
-            ])
-            .split(main_chunks[1]);
-
-        render_header(f, main_chunks[0]);
-        render_instances(f, content_chunks[0], app);
-        render_details(f, content_chunks[1], app);
-        render_footer(f, main_chunks[2], app);
-    } else if app.search_mode {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),  // Search bar
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ])
-            .split(f.area());
-
-        render_header(f, chunks[0]);
-        render_search_bar(f, chunks[1], app);
-        render_instances(f, chunks[2], app);
-        render_footer(f, chunks[3], app);
-    } else {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ])
-            .split(f.area());
-
-        render_header(f, chunks[0]);
-        render_instances(f, chunks[1], app);
-        render_footer(f, chunks[2], app);
-    }
-}
-
-fn render_header(f: &mut Frame, area: Rect) {
-    let title = Paragraph::new("⛏  Minecraft Instance Manager")
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        )
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-        );
-    f.render_widget(title, area);
-}
-
-fn render_search_bar(f: &mut Frame, area: Rect, app: &App) {
-    let search_text = format!("Search: {}", app.search_query);
-    let search_bar = Paragraph::new(search_text)
-        .style(Style::default().fg(Color::Yellow))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" Filter (ESC to exit) ")
-        );
-    f.render_widget(search_bar, area);
-}
-
-fn render_instances(f: &mut Frame, area: Rect, app: &mut App) {
-    if app.filtered_instances.is_empty() {
-        let message = if app.search_mode {
-            Paragraph::new("No instances match your search")
-        } else {
-            Paragraph::new("No Minecraft instances found")
-        }
-            .style(Style::default().fg(Color::Yellow))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::White))
-                    .title(" Instances ")
-            );
-        f.render_widget(message, area);
-        return;
-    }
-
-    let items: Vec<ListItem> = app
-        .filtered_instances
-        .iter()
-        .map(|instance| {
-            let is_running = is_instance_running(&instance.name);
-
-            let mut title_spans = vec![
-                Span::styled("▶ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::styled(&instance.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            ];
-
-            // Add version to title if available
-            if let Some(ref version) = instance.mc_version {
-                title_spans.push(Span::styled(
-                    format!(" [{}]", version),
-                    Style::default().fg(Color::Cyan)
-                ));
-            }
-
-            // Add running indicator
-            if is_running {
-                title_spans.push(Span::styled(
-                    " ● RUNNING",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                ));
-            }
-
-            let mut lines = vec![Line::from(title_spans)];
-
-            let mut info_parts = Vec::new();
-            if let Some(ref time_played) = instance.time_played {
-                info_parts.push(format!("Playtime: {}", time_played));
-            }
-            if let Some(ref last_played) = instance.last_played {
-                info_parts.push(format!("Last played: {}", last_played));
-            }
-
-            if !info_parts.is_empty() {
-                lines.push(Line::from(
-                    Span::styled(
-                        format!("  {}", info_parts.join(" • ")),
-                        Style::default().fg(Color::DarkGray)
-                    )
-                ));
-            }
-
-            ListItem::new(lines).style(Style::default())
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" Select Instance ")
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(50, 50, 80))
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        )
-        .highlight_symbol(">> ");
-
-    f.render_stateful_widget(list, area, &mut app.list_state);
-}
-
-fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let sort_text = format!(" Sort: {}  ", app.sort_mode.display());
-    let help_text = vec![
-        Span::styled("↑↓", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(" Navigate  "),
-        Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::raw(" Launch  "),
-        Span::styled("o", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" Open  "),
-        Span::styled("s", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        Span::raw(sort_text),
-        Span::styled("/", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(" Search  "),
-        Span::styled("i", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
-        Span::raw(" Details  "),
-        Span::styled("q/Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::raw(" Quit"),
-    ];
-
-    let footer = Paragraph::new(Line::from(help_text))
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::White))
-        );
-
-    f.render_widget(footer, area);
-}
-
-fn render_details(f: &mut Frame, area: Rect, app: &App) {
-    if let Some(selected) = app.list_state.selected() {
-        if let Some(instance) = app.filtered_instances.get(selected) {
-            let mut details_lines = vec![];
-
-            details_lines.push(Line::from(vec![
-                Span::styled("Name: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw(&instance.name),
-            ]));
-
-            if let Some(ref version) = instance.mc_version {
-                details_lines.push(Line::from(vec![
-                    Span::styled("Minecraft Version: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw(version),
-                ]));
-            }
-
-            if let Some(ref loader) = instance.mod_loader {
-                details_lines.push(Line::from(vec![
-                    Span::styled("Mod Loader: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw(loader),
-                ]));
-            }
-
-            details_lines.push(Line::from("")); // Blank line
-
-            details_lines.push(Line::from(vec![
-                Span::styled("Path: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            ]));
-            details_lines.push(Line::from(
-                Span::styled(instance.path.display().to_string(), Style::default().fg(Color::DarkGray))
-            ));
-
-            details_lines.push(Line::from("")); // Blank line
-
-            if let Some(ref time_played) = instance.time_played {
-                details_lines.push(Line::from(vec![
-                    Span::styled("Total Playtime: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw(time_played),
-                ]));
-            }
-
-            if let Some(ref last_played) = instance.last_played {
-                details_lines.push(Line::from(vec![
-                    Span::styled("Last Played: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw(last_played),
-                ]));
-            }
-
-            // Count mods
-            let mods_path = instance.path.join("mods");
-            if mods_path.exists() {
-                if let Ok(entries) = fs::read_dir(&mods_path) {
-                    let mod_count = entries
-                        .filter_map(|e| e.ok())
-                        .filter(|e| {
-                            e.path().extension()
-                                .and_then(|ext| ext.to_str())
-                                .map(|ext| ext == "jar")
-                                .unwrap_or(false)
-                        })
-                        .count();
-
-                    details_lines.push(Line::from("")); // Blank line
-                    details_lines.push(Line::from(vec![
-                        Span::styled("Mods: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                        Span::raw(format!("{} installed", mod_count)),
-                    ]));
-                }
-            }
-
-            let details = Paragraph::new(details_lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Blue))
-                        .title(" Instance Details (i to close) ")
-                )
-                .wrap(ratatui::widgets::Wrap { trim: false });
-
-            f.render_widget(details, area);
-            return;
-        }
-    }
-
-    // No instance selected
-    let message = Paragraph::new("No instance selected")
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue))
-                .title(" Instance Details ")
-        );
-    f.render_widget(message, area);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     #[test]
-    fn test_format_duration_hours() {
+    fn filtered_enter_launches_the_displayed_instance() {
+        let mut app = App::demo();
+        app.demo = false;
+        app.handle_key(key(KeyCode::Char('/'))).unwrap();
+        for c in "original".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        assert_eq!(app.filtered_instances.len(), 1);
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(app.should_launch);
+        assert_eq!(app.selected().unwrap().name, "The original");
+    }
+
+    #[test]
+    fn empty_search_never_requests_a_launch_or_invalid_selection() {
+        let mut app = App::demo();
+        app.demo = false;
+        app.search_mode = true;
+        app.search_query = "no such instance".into();
+        app.update_filter();
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        app.next();
+        app.previous();
+        assert!(!app.should_quit);
+        assert!(!app.should_launch);
+        assert_eq!(app.list_state.selected(), None);
+    }
+
+    #[test]
+    fn sort_and_clear_filter_preserve_selection_by_path() {
+        let mut app = App::demo();
+        app.next();
+        let selected = app.selected().unwrap().path.clone();
+        app.handle_key(key(KeyCode::Char('s'))).unwrap();
+        assert_eq!(app.selected().unwrap().path, selected);
+        app.search_mode = true;
+        app.search_query = "Better".into();
+        app.update_filter();
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(!app.search_mode);
+        assert_eq!(app.filtered_instances.len(), 4);
+        assert_eq!(app.selected().unwrap().path, selected);
+    }
+
+    #[test]
+    fn settings_capture_keys_and_demo_never_launches() {
+        let mut app = App::demo();
+        app.handle_key(key(KeyCode::Char(','))).unwrap();
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(app.settings.hide_launcher);
+        assert!(!app.should_launch);
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(!app.should_launch);
+        assert!(!app.should_quit);
+        assert!(app.status.unwrap().contains("Preview"));
+    }
+
+    #[test]
+    fn running_instance_cannot_be_launched_twice() {
+        let mut app = App::demo();
+        app.demo = false;
+        app.running_instances
+            .insert(app.selected().unwrap().path.clone());
+        app.request_launch();
+        assert!(!app.should_launch);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn loads_prism_metadata_and_mods_without_confusing_neoforge() {
+        let root =
+            std::env::temp_dir().join(format!("minecraft-tui-metadata-{}", std::process::id()));
+        let instance = root.join("folder-id");
+        fs::create_dir_all(instance.join(".minecraft/mods")).unwrap();
+        fs::write(
+            instance.join("instance.cfg"),
+            "[General]\nname=Different display name\nlastLaunchTime=0\ntotalTimePlayed=3661\n",
+        )
+        .unwrap();
+        fs::write(instance.join("mmc-pack.json"), r#"{"components":[{"uid":"net.minecraft","version":"1.21.1"},{"uid":"net.neoforged","version":"21.1"}]}"#).unwrap();
+        fs::write(instance.join(".minecraft/mods/mod.jar"), "").unwrap();
+        fs::write(instance.join(".minecraft/mods/disabled.jar.disabled"), "").unwrap();
+        let result = load_instances_from(&[root.clone(), root.clone()]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "Different display name");
+        assert_eq!(result[0].mod_loader.as_deref(), Some("NeoForge"));
+        assert_eq!(result[0].mc_version.as_deref(), Some("1.21.1"));
+        assert_eq!(result[0].mod_count, 1);
+        assert_eq!(result[0].last_played, None);
+        assert_eq!(result[0].time_played.as_deref(), Some("1h 1m"));
+    }
+
+    #[test]
+    fn formats_playtime_and_cycles_sort() {
         assert_eq!(format_duration(3661), "1h 1m");
-    }
-
-    #[test]
-    fn test_format_duration_minutes() {
         assert_eq!(format_duration(120), "2m");
-    }
-
-    #[test]
-    fn test_format_duration_seconds() {
         assert_eq!(format_duration(45), "45s");
-    }
-
-    #[test]
-    fn test_sort_mode_cycle() {
-        let mode = SortMode::Name;
-        assert_eq!(mode.next(), SortMode::LastPlayed);
-        assert_eq!(mode.next().next(), SortMode::Playtime);
-        assert_eq!(mode.next().next().next(), SortMode::Name);
-    }
-
-    #[test]
-    fn test_sort_mode_display() {
-        assert_eq!(SortMode::Name.display(), "Name");
-        assert_eq!(SortMode::LastPlayed.display(), "Last Played");
-        assert_eq!(SortMode::Playtime.display(), "Playtime");
+        assert_eq!(SortMode::Name.next().next().next(), SortMode::Name);
     }
 }
