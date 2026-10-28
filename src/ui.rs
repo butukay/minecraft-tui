@@ -1,29 +1,22 @@
-use super::App;
+use super::{App, theme::Palette};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap,
     },
 };
 
-const BACKGROUND: Color = Color::Rgb(20, 23, 22);
-const SURFACE: Color = Color::Rgb(27, 31, 29);
-const SELECTED: Color = Color::Rgb(39, 52, 45);
-const TEXT: Color = Color::Rgb(222, 228, 222);
-const MUTED: Color = Color::Rgb(147, 158, 149);
-const FAINT: Color = Color::Rgb(82, 96, 87);
-const ACCENT: Color = Color::Rgb(169, 202, 162);
-
 pub(super) fn ui(frame: &mut Frame, app: &mut App) {
+    let palette = &app.settings.theme.palette();
     let area = frame.area();
-    frame.render_widget(Block::default().style(base()), area);
+    frame.render_widget(Block::default().style(base(palette)), area);
     if area.width < 28 || area.height < 10 {
         frame.render_widget(
             Paragraph::new("Make the terminal a little larger\nto view your instances.")
-                .style(muted())
+                .style(muted(palette))
                 .wrap(Wrap { trim: false }),
             area.inner(Margin::new(1, 1)),
         );
@@ -42,9 +35,9 @@ pub(super) fn ui(frame: &mut Frame, app: &mut App) {
         ])
         .split(content);
 
-    render_header(frame, regions[0], app);
+    render_header(frame, regions[0], app, palette);
     if app.search_mode {
-        render_search(frame, regions[1], app);
+        render_search(frame, regions[1], app, palette);
     }
 
     if app.details_mode && content.width >= 88 {
@@ -52,44 +45,87 @@ pub(super) fn ui(frame: &mut Frame, app: &mut App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(regions[2]);
-        render_instances(frame, panes[0], app);
+        render_instances(frame, panes[0], app, palette);
         let detail_area = Rect {
             x: panes[1].x.saturating_add(2),
             width: panes[1].width.saturating_sub(2),
             ..panes[1]
         };
-        render_details(frame, detail_area, app);
+        render_details(frame, detail_area, app, palette);
     } else if app.details_mode {
-        render_details(frame, regions[2], app);
+        render_details(frame, regions[2], app, palette);
     } else {
-        render_instances(frame, regions[2], app);
+        render_instances(frame, regions[2], app, palette);
     }
-    render_footer(frame, regions[3], app);
+    render_footer(frame, regions[3], app, palette);
 
     if app.settings_open {
-        render_settings(frame, area, app);
+        render_settings(frame, area, app, palette);
     } else if app.help_open {
-        render_help(frame, area);
+        render_help(frame, area, palette);
     }
 }
 
-fn base() -> Style {
-    Style::default().fg(TEXT).bg(BACKGROUND)
+fn base(palette: &Palette) -> Style {
+    Style::default().fg(palette.text).bg(palette.background)
 }
 
-fn muted() -> Style {
-    base().fg(MUTED)
+fn muted(palette: &Palette) -> Style {
+    let style = base(palette).fg(if palette.terminal {
+        palette.text
+    } else {
+        palette.muted
+    });
+    if palette.terminal {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    }
 }
 
-fn accent() -> Style {
-    base().fg(ACCENT)
+fn faint(palette: &Palette) -> Style {
+    let style = base(palette).fg(if palette.terminal {
+        palette.text
+    } else {
+        palette.faint
+    });
+    if palette.terminal {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    }
 }
 
-fn strong() -> Style {
-    base().add_modifier(Modifier::BOLD)
+fn selected(palette: &Palette) -> Style {
+    if palette.terminal {
+        base(palette).add_modifier(Modifier::REVERSED)
+    } else {
+        base(palette).bg(palette.selected)
+    }
 }
 
-fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+fn row_muted(style: Style, palette: &Palette) -> Style {
+    let style = style.fg(if palette.terminal {
+        palette.text
+    } else {
+        palette.muted
+    });
+    if palette.terminal {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    }
+}
+
+fn accent(palette: &Palette) -> Style {
+    base(palette).fg(palette.accent)
+}
+
+fn strong(palette: &Palette) -> Style {
+    base(palette).add_modifier(Modifier::BOLD)
+}
+
+fn render_header(frame: &mut Frame, area: Rect, app: &App, palette: &Palette) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -100,10 +136,10 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("▪ ", accent()),
-                Span::styled("minecraft", strong()),
+                Span::styled("▪ ", accent(palette)),
+                Span::styled("minecraft", strong(palette)),
             ]),
-            Line::from(Span::styled("  Instance library", muted())),
+            Line::from(Span::styled("  Instance library", muted(palette))),
         ]),
         columns[0],
     );
@@ -116,46 +152,49 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(format!("{count} {label}"), muted())),
-            Line::from(Span::styled(mode, base().fg(FAINT))),
+            Line::from(Span::styled(format!("{count} {label}"), muted(palette))),
+            Line::from(Span::styled(mode, faint(palette))),
         ])
         .alignment(Alignment::Right),
         columns[1],
     );
 }
 
-fn section(title: String) -> Block<'static> {
+fn section(title: String, palette: &Palette) -> Block<'static> {
     Block::default()
         .borders(Borders::TOP)
-        .border_style(base().fg(FAINT))
-        .title(Line::from(Span::styled(format!(" {title} "), muted())))
+        .border_style(faint(palette))
+        .title(Line::from(Span::styled(
+            format!(" {title} "),
+            muted(palette),
+        )))
 }
 
-fn render_search(frame: &mut Frame, area: Rect, app: &App) {
+fn render_search(frame: &mut Frame, area: Rect, app: &App, palette: &Palette) {
     let bar = Paragraph::new(Line::from(vec![
-        Span::styled("/ ", accent()),
-        Span::styled(&app.search_query, strong()),
-        Span::styled("_", accent()),
+        Span::styled("/ ", accent(palette)),
+        Span::styled(&app.search_query, strong(palette)),
+        Span::styled("_", accent(palette)),
     ]))
     .block(
         Block::default()
             .borders(Borders::BOTTOM)
-            .border_style(base().fg(FAINT)),
+            .border_style(faint(palette)),
     );
     frame.render_widget(bar, area);
 }
 
-fn render_instances(frame: &mut Frame, area: Rect, app: &mut App) {
+fn render_instances(frame: &mut Frame, area: Rect, app: &mut App, palette: &Palette) {
     let count = app.filtered_instances.len();
     let title = if app.search_mode {
         format!("RESULTS  {count}")
     } else {
         "INSTANCES".to_owned()
     };
-    let block = section(title).title(
+    let block = section(title, palette).title(
         Line::from(Span::styled(
             format!(" sort: {} ", app.sort_mode.display()),
-            muted(),
+            muted(palette),
         ))
         .right_aligned(),
     );
@@ -181,9 +220,9 @@ fn render_instances(frame: &mut Frame, area: Rect, app: &mut App) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::default(),
-                Line::from(Span::styled(title, strong())),
+                Line::from(Span::styled(title, strong(palette))),
                 Line::default(),
-                Line::from(Span::styled(hint, muted())),
+                Line::from(Span::styled(hint, muted(palette))),
             ])
             .wrap(Wrap { trim: false }),
             inner,
@@ -197,22 +236,22 @@ fn render_instances(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .enumerate()
         .map(|(index, instance)| {
-            let selected = app.list_state.selected() == Some(index);
-            let row = if selected {
-                base().bg(SELECTED)
+            let is_selected = app.list_state.selected() == Some(index);
+            let row = if is_selected {
+                selected(palette)
             } else {
-                base()
+                base(palette)
             };
             let mut title = vec![Span::styled(
                 &instance.name,
-                row.add_modifier(if selected {
+                row.add_modifier(if is_selected {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
                 }),
             )];
             if app.running_instances.contains(&instance.path) {
-                title.push(Span::styled("  ● running", row.fg(ACCENT)));
+                title.push(Span::styled("  ● running", row.fg(palette.accent)));
             }
             let mut metadata = vec![
                 instance
@@ -246,7 +285,10 @@ fn render_instances(frame: &mut Frame, area: Rect, app: &mut App) {
             }
             let mut lines = vec![
                 Line::from(title),
-                Line::from(Span::styled(metadata.join("  ·  "), row.fg(MUTED))),
+                Line::from(Span::styled(
+                    metadata.join("  ·  "),
+                    row_muted(row, palette),
+                )),
             ];
             if !compact {
                 lines.push(Line::default());
@@ -257,12 +299,12 @@ fn render_instances(frame: &mut Frame, area: Rect, app: &mut App) {
     let list = List::new(items)
         .highlight_symbol("▌ ")
         .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(base().fg(ACCENT).bg(SELECTED));
+        .highlight_style(selected(palette));
     frame.render_stateful_widget(list, inner, &mut app.list_state);
 }
 
-fn render_details(frame: &mut Frame, area: Rect, app: &App) {
-    let block = section("DETAILS".to_owned());
+fn render_details(frame: &mut Frame, area: Rect, app: &App, palette: &Palette) {
+    let block = section("DETAILS".to_owned(), palette);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(instance) = app
@@ -271,7 +313,7 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
         .and_then(|index| app.filtered_instances.get(index))
     else {
         frame.render_widget(
-            Paragraph::new("\nSelect an instance to see its details.").style(muted()),
+            Paragraph::new("\nSelect an instance to see its details.").style(muted(palette)),
             inner,
         );
         return;
@@ -279,40 +321,47 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = vec![
         Line::default(),
-        Line::from(Span::styled(&instance.name, strong())),
+        Line::from(Span::styled(&instance.name, strong(palette))),
         Line::from(Span::styled(
             if app.running_instances.contains(&instance.path) {
                 "● running"
             } else {
                 "Ready to play"
             },
-            accent(),
+            accent(palette),
         )),
         Line::default(),
         detail(
             "Minecraft",
             instance.mc_version.as_deref().unwrap_or("Unknown"),
+            palette,
         ),
         detail(
             "Loader",
             instance.mod_loader.as_deref().unwrap_or("Vanilla"),
+            palette,
         ),
-        detail("Mods", &instance.mod_count.to_string()),
+        detail("Mods", &instance.mod_count.to_string(), palette),
         Line::default(),
         detail(
             "Playtime",
             instance.time_played.as_deref().unwrap_or("Not played yet"),
+            palette,
         ),
         detail(
             "Last played",
             instance.last_played.as_deref().unwrap_or("Never"),
+            palette,
         ),
     ];
     if area.height >= 17 {
         lines.extend([
             Line::default(),
-            Line::from(Span::styled("FOLDER", base().fg(FAINT))),
-            Line::from(Span::styled(instance.path.display().to_string(), muted())),
+            Line::from(Span::styled("FOLDER", faint(palette))),
+            Line::from(Span::styled(
+                instance.path.display().to_string(),
+                muted(palette),
+            )),
         ]);
     }
     frame.render_widget(
@@ -321,38 +370,49 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn detail(label: &str, value: &str) -> Line<'static> {
+fn detail(label: &str, value: &str, palette: &Palette) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<13}"), muted()),
-        Span::styled(value.to_owned(), base()),
+        Span::styled(format!("{label:<13}"), muted(palette)),
+        Span::styled(value.to_owned(), base(palette)),
     ])
 }
 
-fn key(label: &str, action: &str) -> Vec<Span<'static>> {
+fn key(label: &str, action: &str, palette: &Palette) -> Vec<Span<'static>> {
+    let action_style = Style::default()
+        .fg(if palette.terminal {
+            palette.text
+        } else {
+            palette.muted
+        })
+        .add_modifier(if palette.terminal {
+            Modifier::DIM
+        } else {
+            Modifier::empty()
+        });
     vec![
-        Span::styled(label.to_owned(), accent()),
-        Span::styled(format!(" {action}  "), muted()),
+        Span::styled(label.to_owned(), Style::default().fg(palette.accent)),
+        Span::styled(format!(" {action}  "), action_style),
     ]
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+fn render_footer(frame: &mut Frame, area: Rect, app: &App, palette: &Palette) {
     let mut hints = Vec::new();
     if app.search_mode {
-        hints.extend(key("↑↓", "select"));
-        hints.extend(key("enter", "launch"));
-        hints.extend(key("esc", "clear search"));
+        hints.extend(key("↑↓", "select", palette));
+        hints.extend(key("enter", "launch", palette));
+        hints.extend(key("esc", "clear search", palette));
     } else if area.width < 45 {
-        hints.extend(key("enter", "launch"));
-        hints.extend(key("?", "keys"));
+        hints.extend(key("enter", "launch", palette));
+        hints.extend(key("?", "keys", palette));
     } else if area.width < 65 {
-        hints.extend(key("enter", "launch"));
-        hints.extend(key(",", "settings"));
-        hints.extend(key("?", "keys"));
-        hints.extend(key("q", "quit"));
+        hints.extend(key("enter", "launch", palette));
+        hints.extend(key(",", "settings", palette));
+        hints.extend(key("?", "keys", palette));
+        hints.extend(key("q", "quit", palette));
     } else {
-        hints.extend(key("↑↓", "select"));
-        hints.extend(key("enter", "launch"));
-        hints.extend(key("/", "search"));
+        hints.extend(key("↑↓", "select", palette));
+        hints.extend(key("enter", "launch", palette));
+        hints.extend(key("/", "search", palette));
         hints.extend(key(
             "i",
             if app.details_mode {
@@ -360,10 +420,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "details"
             },
+            palette,
         ));
-        hints.extend(key(",", "settings"));
-        hints.extend(key("?", "keys"));
-        hints.extend(key("q", "quit"));
+        hints.extend(key(",", "settings", palette));
+        hints.extend(key("?", "keys", palette));
+        hints.extend(key("q", "quit", palette));
     }
     let status = app.status.clone().unwrap_or_else(|| {
         if app.search_mode {
@@ -377,7 +438,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     });
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(status, muted())),
+            Line::from(Span::styled(status, muted(palette))),
             Line::default(),
             Line::from(hints),
         ]),
@@ -385,7 +446,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn modal(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &str) -> Rect {
+fn modal(
+    frame: &mut Frame,
+    area: Rect,
+    width: u16,
+    height: u16,
+    title: &str,
+    palette: &Palette,
+) -> Rect {
     let width = width.min(area.width.saturating_sub(2));
     let height = height.min(area.height.saturating_sub(2));
     let rect = Rect::new(
@@ -398,53 +466,68 @@ fn modal(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &str) ->
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(base().fg(FAINT))
-        .style(base().bg(SURFACE))
-        .title(Line::from(Span::styled(format!(" {title} "), accent())));
+        .border_style(faint(palette))
+        .style(base(palette).bg(palette.surface))
+        .title(Line::from(Span::styled(
+            format!(" {title} "),
+            accent(palette),
+        )));
     let inner = block.inner(rect).inner(Margin::new(2, 1));
     frame.render_widget(block, rect);
     inner
 }
 
-fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
-    let inner = modal(frame, area, 68, 19, "Settings");
+fn render_settings(frame: &mut Frame, area: Rect, app: &App, palette: &Palette) {
+    let inner = modal(frame, area, 68, 21, "Settings", palette);
     let width = inner.width as usize;
-    let setting_row = |index: usize, label: &str, enabled: bool| {
-        let selected = app.settings_selected == index;
-        let style = if selected {
-            base().bg(SELECTED)
+    let setting_row = |index: usize, label: &str, value: &str, enabled: bool| {
+        let is_selected = app.settings_selected == index;
+        let style = if is_selected {
+            selected(palette)
         } else {
-            base().bg(SURFACE)
+            base(palette).bg(palette.surface)
         };
-        let state = if enabled { "on " } else { "off" };
-        let spacing = width.saturating_sub(label.chars().count() + 9);
+        let value_color = if is_selected && palette.terminal {
+            palette.text
+        } else if enabled {
+            palette.accent
+        } else {
+            palette.muted
+        };
+        let spacing = width.saturating_sub(label.chars().count() + value.chars().count() + 7);
         Line::from(vec![
-            Span::styled(if selected { " › " } else { "   " }, style.fg(ACCENT)),
+            Span::styled(
+                if is_selected { " › " } else { "   " },
+                style.fg(value_color),
+            ),
             Span::styled(label.to_owned(), style),
             Span::styled(" ".repeat(spacing), style),
-            Span::styled(
-                format!(" {state} "),
-                style.fg(if enabled { ACCENT } else { MUTED }),
-            ),
+            Span::styled(format!(" {value} "), style.fg(value_color)),
         ])
     };
-    let compact = inner.height < 13 || inner.width < 48;
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Launch and library preferences",
-            muted().bg(SURFACE),
-        )),
-        Line::default(),
-        setting_row(0, "Hide launcher window", app.settings.hide_launcher),
-        Line::default(),
-        setting_row(1, "Show instance details", app.details_mode),
-        Line::default(),
-    ];
-    if compact {
+    let hide_state = if app.settings.hide_launcher {
+        "on "
+    } else {
+        "off"
+    };
+    let details_state = if app.details_mode { "on " } else { "off" };
+    let theme_value = format!("‹ {} ›", app.settings.theme.display());
+    let description = match app.settings_selected {
+        0 => {
+            "Hide Prism's loading and console windows.\nClose Prism before use. Sign-in and error dialogs\nare hidden too; turn this off if launch stalls."
+        }
+        1 => {
+            "Keep version, mods and playtime close at hand.\nOn smaller terminals, details fill the library."
+        }
+        _ => {
+            "Terminal follows your terminal's colors.\nSage, Violet and Paper use their own palettes.\nUse left / right or enter to change the theme."
+        }
+    };
+    if inner.height < 15 || inner.width < 48 {
         let regions = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
+                Constraint::Length(3),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(2),
@@ -452,87 +535,98 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             .split(inner);
         frame.render_widget(
             Paragraph::new(vec![
-                setting_row(0, "Hide launcher", app.settings.hide_launcher),
-                setting_row(1, "Show details", app.details_mode),
+                setting_row(0, "Hide launcher", hide_state, app.settings.hide_launcher),
+                setting_row(1, "Show details", details_state, app.details_mode),
+                setting_row(2, "Theme", &theme_value, true),
             ]),
             regions[0],
         );
         let description = app
             .status
             .as_deref()
-            .unwrap_or("Hidden mode also hides sign-in.\nClose Prism before use.");
+            .unwrap_or(match app.settings_selected {
+                0 => "Hidden mode also hides sign-in.\nClose Prism before use.",
+                1 => "Details replace the library\non smaller terminals.",
+                _ => "Terminal follows your colors.\n← / → change theme.",
+            });
         frame.render_widget(
             Paragraph::new(description)
-                .style(muted().bg(SURFACE))
+                .style(muted(palette).bg(palette.surface))
                 .wrap(Wrap { trim: false }),
             regions[2],
         );
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "↑↓ select · space toggle",
-                    accent().bg(SURFACE),
+                    "↑↓ select · space change",
+                    accent(palette).bg(palette.surface),
                 )),
-                Line::from(Span::styled("esc close", muted().bg(SURFACE))),
+                Line::from(Span::styled(
+                    "←→ change · esc close",
+                    muted(palette).bg(palette.surface),
+                )),
             ]),
             regions[3],
         );
         return;
     }
-    if app.settings_selected == 0 {
-        lines.extend([
-            Line::from(Span::styled(
-                "Hide Prism's loading and console windows.",
-                muted().bg(SURFACE),
-            )),
-            Line::from(Span::styled(
-                "Close Prism before use. Sign-in and error dialogs",
-                muted().bg(SURFACE),
-            )),
-            Line::from(Span::styled(
-                "are hidden too; turn this off if launch stalls.",
-                muted().bg(SURFACE),
-            )),
-        ]);
-    } else {
-        lines.extend([
-            Line::from(Span::styled(
-                "Keep version, mods and playtime close at hand.",
-                muted().bg(SURFACE),
-            )),
-            Line::from(Span::styled(
-                "On smaller terminals, details fill the library.",
-                muted().bg(SURFACE),
-            )),
+    let regions = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(6),
+            Constraint::Min(0),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new("Launch and library preferences").style(muted(palette).bg(palette.surface)),
+        regions[0],
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            setting_row(
+                0,
+                "Hide launcher window",
+                hide_state,
+                app.settings.hide_launcher,
+            ),
             Line::default(),
-        ]);
-    }
-    lines.extend([
-        Line::default(),
-        Line::from(Span::styled(
-            app.status.as_deref().unwrap_or("Saved automatically"),
-            base().fg(FAINT).bg(SURFACE),
-        )),
-        Line::default(),
-        Line::from(
+            setting_row(1, "Show instance details", details_state, app.details_mode),
+            Line::default(),
+            setting_row(2, "Theme", &theme_value, true),
+        ]),
+        regions[1],
+    );
+    frame.render_widget(
+        Paragraph::new(description)
+            .style(muted(palette).bg(palette.surface))
+            .wrap(Wrap { trim: false }),
+        regions[2],
+    );
+    frame.render_widget(
+        Paragraph::new(app.status.as_deref().unwrap_or("Saved automatically"))
+            .style(faint(palette).bg(palette.surface))
+            .wrap(Wrap { trim: false }),
+        regions[3],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(
             [
-                key("↑↓", "select"),
-                key("space/enter", "toggle"),
-                key("esc", "close"),
+                key("↑↓", "select", palette),
+                key("←→ / enter", "change", palette),
+                key("esc", "close", palette),
             ]
             .concat(),
-        ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(base().bg(SURFACE))
-            .wrap(Wrap { trim: false }),
-        inner,
+        ))
+        .style(base(palette).bg(palette.surface)),
+        regions[4],
     );
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let inner = modal(frame, area, 59, 21, "Keyboard shortcuts");
+fn render_help(frame: &mut Frame, area: Rect, palette: &Palette) {
+    let inner = modal(frame, area, 59, 21, "Keyboard shortcuts", palette);
     if inner.width < 40 || inner.height < 15 {
         let lines = [
             "j/k, ↑↓   select",
@@ -548,7 +642,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             Paragraph::new(
                 lines
                     .into_iter()
-                    .map(|text| Line::from(Span::styled(text, muted().bg(SURFACE))))
+                    .map(|text| Line::from(Span::styled(text, muted(palette).bg(palette.surface))))
                     .collect::<Vec<_>>(),
             ),
             inner,
@@ -571,17 +665,23 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let mut lines = vec![Line::default()];
     for (shortcut, action) in actions {
         lines.push(Line::from(vec![
-            Span::styled(format!("{shortcut:<16}"), accent().bg(SURFACE)),
-            Span::styled(action, base().bg(SURFACE)),
+            Span::styled(
+                format!("{shortcut:<16}"),
+                accent(palette).bg(palette.surface),
+            ),
+            Span::styled(action, base(palette).bg(palette.surface)),
         ]));
     }
     lines.extend([
         Line::default(),
-        Line::from(Span::styled("Press any key to close", muted().bg(SURFACE))),
+        Line::from(Span::styled(
+            "Press any key to close",
+            muted(palette).bg(palette.surface),
+        )),
     ]);
     frame.render_widget(
         Paragraph::new(lines)
-            .style(base().bg(SURFACE))
+            .style(base(palette).bg(palette.surface))
             .wrap(Wrap { trim: false }),
         inner,
     );
@@ -590,16 +690,23 @@ fn render_help(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
+    use crate::theme::Theme;
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Color};
 
-    fn render(app: &mut App, width: u16, height: u16) -> String {
+    fn render_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| ui(frame, app)).unwrap();
-        terminal
-            .backend()
-            .buffer()
+        terminal.backend().buffer().clone()
+    }
+
+    fn render(app: &mut App, width: u16, height: u16) -> String {
+        buffer_text(&render_buffer(app, width, height))
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        buffer
             .content()
-            .chunks(width as usize)
+            .chunks(buffer.area.width as usize)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
@@ -633,7 +740,7 @@ mod tests {
         }
         app.settings_open = true;
         let text = render(&mut app, 40, 16);
-        assert!(text.contains("space toggle"));
+        assert!(text.contains("space change"));
         assert!(text.contains("esc close"));
         app.status = Some("Could not save settings: read-only".to_owned());
         let text = render(&mut app, 40, 16);
@@ -641,12 +748,92 @@ mod tests {
         assert!(text.contains("read-only"));
         assert!(text.contains("Hide launcher"));
         assert!(text.contains("Show details"));
-        assert!(text.contains("space toggle"));
+        assert!(text.contains("Theme"));
+        assert!(text.contains("Terminal"));
+        assert!(text.contains("space change"));
         assert!(text.contains("esc close"));
         app.settings_open = false;
         app.details_mode = true;
         let text = render(&mut app, 80, 24);
         assert!(text.contains("DETAILS"));
         assert!(!text.contains("INSTANCES"));
+    }
+
+    #[test]
+    fn terminal_theme_inherits_colors_in_every_view() {
+        let mut app = App::demo();
+        assert_eq!(app.settings.theme, Theme::Terminal);
+        for view in 0..5 {
+            app.search_mode = view == 1;
+            app.details_mode = view == 2;
+            app.settings_open = view == 3;
+            app.help_open = view == 4;
+            let buffer = render_buffer(&mut app, 110, 32);
+            assert!(
+                buffer.content().iter().all(|cell| {
+                    cell.bg == Color::Reset && !matches!(cell.fg, Color::Rgb(_, _, _))
+                }),
+                "terminal colors must be inherited in view {view}"
+            );
+        }
+        app.help_open = false;
+        let buffer = render_buffer(&mut app, 110, 32);
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.modifier.contains(Modifier::REVERSED))
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.modifier.contains(Modifier::DIM))
+        );
+    }
+
+    #[test]
+    fn selected_themes_apply_to_search_details_and_overlays() {
+        let mut app = App::demo();
+        let terminal = render_buffer(&mut app, 110, 32);
+        for theme in Theme::ALL {
+            app.settings.theme = theme;
+            let palette = theme.palette();
+            for view in 0..5 {
+                app.search_mode = view == 1;
+                app.details_mode = view == 2;
+                app.settings_open = view == 3;
+                app.settings_selected = 2;
+                app.help_open = view == 4;
+                let buffer = render_buffer(&mut app, 110, 32);
+                assert!(
+                    buffer.content().iter().all(|cell| {
+                        [palette.background, palette.surface, palette.selected].contains(&cell.bg)
+                    }),
+                    "unexpected background in {theme:?}, view {view}"
+                );
+                assert!(
+                    buffer
+                        .content()
+                        .iter()
+                        .any(|cell| cell.fg == palette.accent)
+                );
+                assert!(
+                    buffer.content().iter().all(|cell| {
+                        [palette.text, palette.muted, palette.faint, palette.accent]
+                            .contains(&cell.fg)
+                    }),
+                    "unexpected foreground in {theme:?}, view {view}"
+                );
+                if theme != Theme::Terminal {
+                    assert_ne!(buffer, terminal);
+                    assert_eq!(buffer[(0, 0)].bg, palette.background);
+                }
+                if view == 3 {
+                    assert!(buffer_text(&buffer).contains(theme.display()));
+                    assert!(buffer_text(&buffer).contains("Theme"));
+                }
+            }
+        }
     }
 }

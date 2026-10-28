@@ -1,12 +1,15 @@
 # Minecraft TUI
 
-![Minecraft TUI instance library](docs/preview.png)
+![Minecraft TUI instance library in the Sage theme](docs/preview.png)
 
-A quiet, keyboard-driven library for your [Prism Launcher](https://prismlauncher.org/) instances. Built with Rust and Ratatui, with a graphite palette, a soft green accent, and room for the things that matter.
+*Preview: Sage theme.*
+
+A quiet, keyboard-driven library for your [Prism Launcher](https://prismlauncher.org/) instances. Built with Rust and Ratatui, with restrained styling, a choice of themes, and room for the things that matter.
 
 - Search and sort instances by name, last played, or playtime.
 - See Minecraft versions, mod loaders, installed mods, and running instances.
 - Open instance folders or launch a game directly from the terminal.
+- Match your terminal colors or choose a built-in theme.
 - Keep your preferences, including an optional hidden Prism window.
 - Use native Prism Launcher or its Flatpak package on Linux.
 
@@ -54,7 +57,24 @@ Demo mode does not launch games or save preferences.
 | `q` / `Esc` | Quit or close the current overlay |
 | `Ctrl-C` | Quit |
 
-In settings, use `↑` / `↓` to select a preference and `Enter` or `Space` to toggle it. Preferences are saved when changed. On narrow terminals, details replace the library; press `i` to return.
+In settings, use `↑` / `↓` to select a preference and `Enter` or `Space` to change it. On the **Theme** row, `←` / `→` cycle backward or forward; `Enter` or `Space` selects the next theme. Changes apply immediately and are saved. On narrow terminals, details replace the library; press `i` to return.
+
+## Themes
+
+Open settings with `,` and select the third row, **Theme**:
+
+| Theme | Appearance |
+| --- | --- |
+| **Terminal** (default) | Uses your terminal's background and ANSI palette, preserving terminal-managed transparency. |
+| **Sage** | The original graphite background with a soft green accent. |
+| **Violet** | A dark purple background with a lilac accent. |
+| **Paper** | A light background with muted accents. |
+
+The Terminal theme follows the terminal's configured colors; the other themes use fixed palettes. Existing settings files without a `theme` field use Terminal automatically.
+
+![Minecraft TUI instance library in the Violet theme](docs/preview-violet.png)
+
+*Violet theme.*
 
 ## Hide the Prism window
 
@@ -78,9 +98,12 @@ Preferences live at `$XDG_CONFIG_HOME/minecraft-tui/config.json`, or `~/.config/
 ```json
 {
   "hide_launcher": false,
-  "details": false
+  "details": false,
+  "theme": "terminal"
 }
 ```
+
+Theme values are `terminal`, `sage`, `violet`, and `paper`.
 
 Instances and accounts remain managed by Prism Launcher. Create, import, update, and authenticate them there, then press `r` in the TUI to refresh the library.
 

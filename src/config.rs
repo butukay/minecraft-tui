@@ -1,3 +1,4 @@
+use crate::theme::Theme;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,6 +12,7 @@ use std::{
 pub struct Settings {
     pub hide_launcher: bool,
     pub details: bool,
+    pub theme: Theme,
 }
 
 impl Settings {
@@ -98,6 +100,7 @@ mod tests {
         let settings = Settings {
             hide_launcher: true,
             details: false,
+            theme: Theme::Violet,
         };
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path).unwrap(), settings);
@@ -106,11 +109,29 @@ mod tests {
             Settings::load_from(&path).unwrap(),
             Settings {
                 hide_launcher: true,
-                details: false
+                details: false,
+                theme: Theme::Terminal,
             }
         );
         fs::write(&path, "broken json").unwrap();
         assert!(Settings::load_from(&path).is_err());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn every_theme_round_trips_with_stable_json_names() {
+        for (theme, name) in Theme::ALL
+            .into_iter()
+            .zip(["terminal", "sage", "violet", "paper"])
+        {
+            let settings = Settings {
+                theme,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&settings).unwrap();
+            assert!(json.contains(&format!(r#""theme":"{name}""#)));
+            assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), settings);
+        }
+        assert!(serde_json::from_str::<Settings>(r#"{"theme":"unknown"}"#).is_err());
     }
 }

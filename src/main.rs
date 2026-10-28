@@ -1,5 +1,6 @@
 mod config;
 mod launcher;
+mod theme;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -18,6 +19,8 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const SETTINGS_COUNT: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SortMode {
@@ -301,12 +304,21 @@ impl App {
         }
     }
 
-    fn toggle_setting(&mut self) {
-        if self.settings_selected == 0 {
-            self.settings.hide_launcher = !self.settings.hide_launcher;
-        } else {
-            self.settings.details = !self.settings.details;
-            self.details_mode = self.settings.details;
+    fn change_setting(&mut self, forward: bool) {
+        match self.settings_selected {
+            0 => self.settings.hide_launcher = !self.settings.hide_launcher,
+            1 => {
+                self.settings.details = !self.settings.details;
+                self.details_mode = self.settings.details;
+            }
+            2 => {
+                self.settings.theme = if forward {
+                    self.settings.theme.next()
+                } else {
+                    self.settings.theme.previous()
+                };
+            }
+            _ => return,
         }
         self.save_settings();
     }
@@ -324,12 +336,15 @@ impl App {
                 KeyCode::Esc | KeyCode::Char(',') | KeyCode::Char('q') => {
                     self.settings_open = false
                 }
-                KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k') | KeyCode::Tab => {
-                    self.settings_selected ^= 1
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    self.settings_selected = (self.settings_selected + 1) % SETTINGS_COUNT;
                 }
-                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
-                    self.toggle_setting()
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    self.settings_selected =
+                        (self.settings_selected + SETTINGS_COUNT - 1) % SETTINGS_COUNT;
                 }
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => self.change_setting(true),
+                KeyCode::Left => self.change_setting(false),
                 _ => {}
             }
         } else if self.help_open {
@@ -680,6 +695,33 @@ mod tests {
         assert!(!app.should_launch);
         assert!(!app.should_quit);
         assert!(app.status.unwrap().contains("Preview"));
+    }
+
+    #[test]
+    fn themes_change_in_both_directions_without_toggling_other_preferences() {
+        use theme::Theme;
+
+        let mut app = App::demo();
+        assert_eq!(app.settings.theme, Theme::Terminal);
+        app.handle_key(key(KeyCode::Char(','))).unwrap();
+        // Up wraps from the first setting to the theme picker.
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        assert_eq!(app.settings_selected, 2);
+        let hide_launcher = app.settings.hide_launcher;
+        let details = app.settings.details;
+        app.handle_key(key(KeyCode::Right)).unwrap();
+        assert_eq!(app.settings.theme, Theme::Sage);
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.settings.theme, Theme::Violet);
+        app.handle_key(key(KeyCode::Left)).unwrap();
+        assert_eq!(app.settings.theme, Theme::Sage);
+        assert_eq!(app.settings.hide_launcher, hide_launcher);
+        assert_eq!(app.settings.details, details);
+        assert!(!app.should_launch);
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+        assert_eq!(app.settings_selected, 0);
+        app.handle_key(key(KeyCode::BackTab)).unwrap();
+        assert_eq!(app.settings_selected, 2);
     }
 
     #[test]
