@@ -21,6 +21,23 @@ use std::{
 };
 
 const SETTINGS_COUNT: usize = 3;
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone)]
+struct LaunchProgress {
+    name: String,
+    stage: String,
+    started: Instant,
+    tick: u64,
+}
+
+struct ActiveLaunch {
+    instance: Instance,
+    handle: launcher::LaunchHandle,
+    progress: LaunchProgress,
+    last_process_check: Instant,
+    game_seen_since: Option<Instant>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SortMode {
@@ -102,6 +119,8 @@ struct App {
     help_open: bool,
     status: Option<String>,
     running_instances: HashSet<PathBuf>,
+    launch_progress: Option<LaunchProgress>,
+    active_launch: Option<ActiveLaunch>,
     demo: bool,
 }
 
@@ -130,6 +149,8 @@ impl App {
             help_open: false,
             status: None,
             running_instances: HashSet::new(),
+            launch_progress: None,
+            active_launch: None,
             demo: false,
         };
         app.sort_instances();
@@ -214,15 +235,27 @@ impl App {
     }
 
     fn request_launch(&mut self) {
+        if let Some(active) = &self.active_launch {
+            if self
+                .selected()
+                .is_some_and(|instance| instance.path == active.instance.path)
+            {
+                self.launch_progress = Some(active.progress.clone());
+            } else {
+                self.status = Some(format!("{} is still starting", active.instance.name));
+            }
+            return;
+        }
         if let Some(instance) = self.selected() {
             if self.demo {
                 self.status = Some("Preview only · no game will be launched".into());
             } else if self.running_instances.contains(&instance.path) {
                 self.status = Some("This instance is already running".into());
             } else {
-                // Preserve the filtered selection until after terminal restoration.
+                // Visible Prism launches after restoration. Hidden Prism is started
+                // inside the event loop so its progress stays in the terminal.
                 self.should_launch = true;
-                self.should_quit = true;
+                self.should_quit = !self.settings.hide_launcher;
             }
         }
     }
@@ -232,6 +265,82 @@ impl App {
             launcher::launch_instance(&instance.path, self.settings.hide_launcher)?;
         }
         Ok(())
+    }
+
+    fn begin_hidden_launch(&mut self) -> Result<()> {
+        self.should_launch = false;
+        let instance = self.selected().cloned().context("No instance selected")?;
+        let started = Instant::now();
+        let handle = launcher::start_instance(&instance.path, true)?;
+        let progress = LaunchProgress {
+            name: instance.name.clone(),
+            stage: launcher::LaunchPhase::Preparing.display().into(),
+            started,
+            tick: 0,
+        };
+        self.status = None;
+        self.launch_progress = Some(progress.clone());
+        self.active_launch = Some(ActiveLaunch {
+            instance,
+            handle,
+            progress,
+            last_process_check: started,
+            game_seen_since: None,
+        });
+        Ok(())
+    }
+
+    fn poll_hidden_launch(&mut self) {
+        let Some(mut active) = self.active_launch.take() else {
+            return;
+        };
+        let update = match active.handle.poll() {
+            Ok(update) => update,
+            Err(error) => {
+                self.launch_progress = None;
+                self.status = Some(format!(
+                    "Could not monitor launch: {error:#} · check launcher.log"
+                ));
+                return;
+            }
+        };
+        if let Some(failure) = update.failure {
+            self.launch_progress = None;
+            self.status = Some(format!("Launch failed: {failure} · check launcher.log"));
+            return;
+        }
+        active.progress.stage = update.phase.display().into();
+        active.progress.tick = active.progress.tick.wrapping_add(1);
+        if active.last_process_check.elapsed() >= Duration::from_millis(250) {
+            let running = running_instances(std::slice::from_ref(&active.instance));
+            if running.contains(&active.instance.path) {
+                let seen = active.game_seen_since.get_or_insert_with(Instant::now);
+                active.progress.stage = "Starting Minecraft".into();
+                // Ignore transient Java checks and immediately crashing JVMs.
+                if seen.elapsed() >= Duration::from_millis(750) {
+                    self.running_instances.insert(active.instance.path.clone());
+                    self.should_quit = self.launch_progress.is_some();
+                    self.launch_progress = None;
+                    self.status = Some(format!(
+                        "Minecraft process started · {}",
+                        active.instance.name
+                    ));
+                    return;
+                }
+            } else {
+                active.game_seen_since = None;
+            }
+            active.last_process_check = Instant::now();
+        }
+        if active.progress.started.elapsed() >= LAUNCH_TIMEOUT {
+            self.launch_progress = None;
+            self.status = Some("Still starting after 2 minutes · launch continues; check launcher.log or open Prism".into());
+            return;
+        }
+        if self.launch_progress.is_some() {
+            self.launch_progress = Some(active.progress.clone());
+        }
+        self.active_launch = Some(active);
     }
 
     fn open_folder_selected(&self) -> Result<()> {
@@ -329,6 +438,17 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
+            return Ok(());
+        }
+        if self.launch_progress.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.launch_progress = None;
+                    self.status = Some("Launch continues in the background · select it and press Enter to view progress".into());
+                }
+                KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            }
             return Ok(());
         }
         if self.settings_open {
@@ -498,6 +618,15 @@ fn detect_loader(components: &[Component]) -> &'static str {
 
 fn running_instances(instances: &[Instance]) -> HashSet<PathBuf> {
     let mut running = HashSet::new();
+    let paths: Vec<_> = instances
+        .iter()
+        .map(|instance| {
+            (
+                &instance.path,
+                fs::canonicalize(&instance.path).unwrap_or_else(|_| instance.path.clone()),
+            )
+        })
+        .collect();
     let Ok(processes) = fs::read_dir("/proc") else {
         return running;
     };
@@ -518,14 +647,20 @@ fn running_instances(instances: &[Instance]) -> HashSet<PathBuf> {
             continue;
         }
         let args = fs::read(proc_path.join("cmdline")).unwrap_or_default();
+        if is_java_checker(&args) {
+            continue;
+        }
         let cwd = fs::read_link(proc_path.join("cwd")).ok();
-        for instance in instances {
-            if cwd.as_ref().is_some_and(|p| p.starts_with(&instance.path))
+        for (path, canonical) in &paths {
+            if cwd
+                .as_ref()
+                .is_some_and(|p| p.starts_with(path) || p.starts_with(canonical))
                 || args.split(|&b| b == 0).any(|arg| {
-                    Path::new(std::ffi::OsStr::from_bytes(arg)).starts_with(&instance.path)
+                    let argument = Path::new(std::ffi::OsStr::from_bytes(arg));
+                    argument.starts_with(path) || argument.starts_with(canonical)
                 })
             {
-                running.insert(instance.path.clone());
+                running.insert((*path).clone());
             }
         }
     }
@@ -533,6 +668,14 @@ fn running_instances(instances: &[Instance]) -> HashSet<PathBuf> {
 }
 
 use std::os::unix::ffi::OsStrExt;
+
+fn is_java_checker(arguments: &[u8]) -> bool {
+    arguments.split(|&byte| byte == 0).any(|argument| {
+        Path::new(std::ffi::OsStr::from_bytes(argument))
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("JavaCheck.jar"))
+    })
+}
 
 fn format_timestamp(timestamp_ms: u64) -> String {
     let elapsed = UNIX_EPOCH
@@ -616,8 +759,18 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut last_running_check = Instant::now();
     while !app.should_quit {
+        if app.should_launch
+            && app.settings.hide_launcher
+            && let Err(error) = app.begin_hidden_launch()
+        {
+            app.status = Some(format!("Could not start Prism: {error:#}"));
+        }
+        app.poll_hidden_launch();
+        if app.should_quit {
+            break;
+        }
         terminal.draw(|frame| ui::ui(frame, app))?;
-        if event::poll(Duration::from_millis(200))?
+        if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && let Err(err) = app.handle_key(key)
         {
@@ -722,6 +875,48 @@ mod tests {
         assert_eq!(app.settings_selected, 0);
         app.handle_key(key(KeyCode::BackTab)).unwrap();
         assert_eq!(app.settings_selected, 2);
+    }
+
+    #[test]
+    fn hidden_launch_request_keeps_terminal_open_for_progress() {
+        let mut app = App::demo();
+        app.demo = false;
+        app.settings.hide_launcher = true;
+        app.request_launch();
+        assert!(app.should_launch);
+        assert!(!app.should_quit);
+        assert_eq!(app.selected().unwrap().name, "A quiet world");
+    }
+
+    #[test]
+    fn loading_keys_dismiss_or_quit_without_requesting_another_launch() {
+        let mut app = App::demo();
+        let progress = LaunchProgress {
+            name: "Sample".into(),
+            stage: "Preparing instance".into(),
+            started: Instant::now(),
+            tick: 0,
+        };
+        app.launch_progress = Some(progress.clone());
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(!app.should_launch);
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(app.launch_progress.is_none());
+        assert!(!app.should_quit);
+        app.launch_progress = Some(progress);
+        app.handle_key(key(KeyCode::Char('q'))).unwrap();
+        assert!(app.should_quit);
+        assert!(!app.should_launch);
+    }
+
+    #[test]
+    fn prism_java_checks_are_not_minecraft_processes() {
+        assert!(is_java_checker(
+            b"java\0-jar\0/app/bin/jars/JavaCheck.jar\0"
+        ));
+        assert!(!is_java_checker(
+            b"java\0-cp\0/app/bin/jars/NewLaunch.jar\0org.prismlauncher.EntryPoint\0"
+        ));
     }
 
     #[test]

@@ -10,6 +10,7 @@ A quiet, keyboard-driven library for your [Prism Launcher](https://prismlauncher
 - See Minecraft versions, mod loaders, installed mods, and running instances.
 - Open instance folders or launch a game directly from the terminal.
 - Match your terminal colors or choose a built-in theme.
+- Follow hidden launches in the terminal with a spinner and elapsed time.
 - Keep your preferences, including an optional hidden Prism window.
 - Use native Prism Launcher or its Flatpak package on Linux.
 
@@ -84,7 +85,18 @@ Prism has no dedicated command-line switch for hiding its launch progress dialog
 
 Complete account sign-in, Java setup, and any interactive prompts in visible Prism first. Offscreen mode also hides sign-in and error dialogs; turn the option off if a launch needs attention. Close any existing Prism process before using it: an already running launcher handles launch requests with its existing window settings.
 
-Minecraft continues running after the TUI closes. Launch output is saved to `$XDG_STATE_HOME/minecraft-tui/launcher.log`, or `~/.local/state/minecraft-tui/launcher.log` when unset. If your Qt installation lacks the offscreen platform plugin, disable this option and check that log.
+When hidden launch is enabled, pressing `Enter` keeps the terminal open with a loading screen: a spinner, elapsed time, and the current preparation stage. It follows the selected theme and shows no estimated percentage. The TUI closes when it detects the instance's Minecraft Java process; this means the process has started, not that its game window is ready.
+
+![Hidden launch progress in the terminal](docs/preview-launch.png)
+
+- `Esc` returns to the library while Prism continues preparing the game. Press `Enter` on the same instance to reopen its loading screen. Another launch is blocked while preparation is being monitored.
+- `q` or `Ctrl-C` closes the TUI while the launch continues.
+- A detected failure returns to the library with a brief error and a launch log hint.
+- After two minutes without detecting the game process, the TUI returns to the library with an attention message. This ends monitoring without stopping Prism or Minecraft; check the log or try a visible launch if interaction is needed.
+
+If the game process is detected after you have returned with `Esc`, the library stays open and shows a status message instead of closing.
+
+Minecraft continues running after the TUI closes. Launch output is saved to `$XDG_STATE_HOME/minecraft-tui/launcher.log`, or `~/.local/state/minecraft-tui/launcher.log` when unset. Each new launch moves the previous log to a `launcher-*.log` archive in the same directory. If your Qt installation lacks the offscreen platform plugin, disable this option and check the current log.
 
 ## Data and preferences
 

@@ -15,11 +15,20 @@ pub(super) fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Block::default().style(base(palette)), area);
     if area.width < 28 || area.height < 10 {
         frame.render_widget(
-            Paragraph::new("Make the terminal a little larger\nto view your instances.")
-                .style(muted(palette))
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(if app.launch_progress.is_some() {
+                "Starting Minecraft\nResize the terminal for progress.\nEsc back"
+            } else {
+                "Make the terminal a little larger\nto view your instances."
+            })
+            .style(muted(palette))
+            .wrap(Wrap { trim: false }),
             area.inner(Margin::new(1, 1)),
         );
+        return;
+    }
+
+    if app.launch_progress.is_some() {
+        render_launch_progress(frame, area, app, palette);
         return;
     }
 
@@ -64,6 +73,83 @@ pub(super) fn ui(frame: &mut Frame, app: &mut App) {
     } else if app.help_open {
         render_help(frame, area, palette);
     }
+}
+
+fn render_launch_progress(frame: &mut Frame, area: Rect, app: &App, palette: &Palette) {
+    let Some(progress) = app.launch_progress.as_ref() else {
+        return;
+    };
+    let content = area.inner(Margin::new(if area.width >= 80 { 3 } else { 1 }, 1));
+    let regions = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(content);
+    render_header(frame, regions[0], app, palette);
+
+    let width = regions[1].width.min(64);
+    let height = regions[1].height.min(10);
+    let center = Rect::new(
+        regions[1].x + regions[1].width.saturating_sub(width) / 2,
+        regions[1].y + regions[1].height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let lines = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(center);
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    frame.render_widget(
+        Paragraph::new(SPINNER[(progress.tick % SPINNER.len() as u64) as usize])
+            .style(accent(palette))
+            .alignment(Alignment::Center),
+        lines[0],
+    );
+    frame.render_widget(
+        Paragraph::new("Starting Minecraft")
+            .style(strong(palette))
+            .alignment(Alignment::Center),
+        lines[2],
+    );
+    frame.render_widget(
+        Paragraph::new(progress.name.as_str())
+            .style(muted(palette))
+            .alignment(Alignment::Center),
+        lines[3],
+    );
+    frame.render_widget(
+        Paragraph::new(progress.stage.as_str())
+            .style(muted(palette))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        lines[5],
+    );
+    frame.render_widget(
+        Paragraph::new(format!("{}s elapsed", progress.started.elapsed().as_secs()))
+            .style(faint(palette))
+            .alignment(Alignment::Center),
+        lines[6],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("esc", Style::default().fg(palette.accent)),
+            Span::styled(" back · game keeps starting", muted(palette)),
+        ]))
+        .alignment(Alignment::Center),
+        regions[2],
+    );
 }
 
 fn base(palette: &Palette) -> Style {
@@ -139,7 +225,14 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, palette: &Palette) {
                 Span::styled("▪ ", accent(palette)),
                 Span::styled("minecraft", strong(palette)),
             ]),
-            Line::from(Span::styled("  Instance library", muted(palette))),
+            Line::from(Span::styled(
+                if app.launch_progress.is_some() {
+                    "  Launch in progress"
+                } else {
+                    "  Instance library"
+                },
+                muted(palette),
+            )),
         ]),
         columns[0],
     );
@@ -690,8 +783,9 @@ fn render_help(frame: &mut Frame, area: Rect, palette: &Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::Theme;
+    use crate::{LaunchProgress, theme::Theme};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Color};
+    use std::time::{Duration, Instant};
 
     fn render_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -835,5 +929,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn launch_progress_shows_real_stage_elapsed_and_dismiss_controls_in_every_theme() {
+        let mut app = App::demo();
+        app.launch_progress = Some(LaunchProgress {
+            name: "A quiet world".to_owned(),
+            stage: "Preparing libraries and assets".to_owned(),
+            started: Instant::now() - Duration::from_secs(12),
+            tick: 0,
+        });
+        for theme in Theme::ALL {
+            app.settings.theme = theme;
+            let palette = theme.palette();
+            for (width, height) in [(80, 24), (40, 16)] {
+                let buffer = render_buffer(&mut app, width, height);
+                let text = buffer_text(&buffer);
+                for label in [
+                    "Starting Minecraft",
+                    "A quiet world",
+                    "Preparing libraries and assets",
+                    "elapsed",
+                    "esc",
+                    "back · game keeps starting",
+                    "⠋",
+                ] {
+                    assert!(
+                        text.contains(label),
+                        "missing {label:?} in {theme:?} at {width}x{height}"
+                    );
+                }
+                assert!(!text.contains("INSTANCES"));
+                assert!(
+                    buffer
+                        .content()
+                        .iter()
+                        .all(|cell| cell.bg == palette.background)
+                );
+                assert!(
+                    buffer
+                        .content()
+                        .iter()
+                        .any(|cell| cell.fg == palette.accent)
+                );
+                if theme == Theme::Terminal {
+                    assert!(
+                        buffer
+                            .content()
+                            .iter()
+                            .all(|cell| !matches!(cell.fg, Color::Rgb(..)))
+                    );
+                }
+            }
+        }
+        app.launch_progress.as_mut().unwrap().tick = 1;
+        assert!(render(&mut app, 80, 24).contains("⠙"));
     }
 }
